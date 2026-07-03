@@ -3,6 +3,7 @@ const __modules = {
   "src/helpers.js": function(module, exports, __require) {
 const { setIcon } = require("obsidian");
 
+// Shared constants plus small pure helpers for dates, labels, Markdown, and DOM controls.
 const VIEW_TYPE = "obsidian-tasks-kanban-view";
 const CARD_FOLDER = "Kanban Cards";
 const LIST_DRAG_TYPE = "application/x-obsidian-tasks-kanban-list";
@@ -17,6 +18,13 @@ const LABEL_COLORS = [
   "#68a0ee", "#70c1d8", "#96c949", "#dc6ab5", "#a3a6aa",
 ];
 
+/**
+ * Minimal saved-data shape used when the plugin starts with no existing board.
+ *
+ * Cards are stored in a top-level map and lists keep card ids. This makes
+ * moving cards between lists cheap while still letting each card have one
+ * Markdown file on disk.
+ */
 const DEFAULT_DATA = {
   version: 1,
   activeBoardId: "default",
@@ -43,6 +51,9 @@ function textLine(value) {
   return String(value || "").replace(/\r?\n/g, " ").trim();
 }
 
+/**
+ * Accepts only the storage format used in card frontmatter: YYYY-MM-DD.
+ */
 function cleanDate(value) {
   const date = textLine(value);
   return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
@@ -106,6 +117,9 @@ function cleanLabelName(label) {
   return name === "---" ? "" : name;
 }
 
+/**
+ * Builds a vault-safe card filename from a title.
+ */
 function slugify(value) {
   const slug = String(value || "card")
     .normalize("NFD")
@@ -160,6 +174,9 @@ function textButton(icon, label, onClick) {
   return button;
 }
 
+/**
+ * Reads a second-level Markdown section body, stopping before the next H2.
+ */
 function getSection(markdown, heading) {
   const marker = `## ${heading}`;
   const start = markdown.indexOf(marker);
@@ -178,6 +195,12 @@ function getSectionAny(markdown, headings) {
   return "";
 }
 
+/**
+ * Converts Markdown checklist lines into the card checklist model.
+ *
+ * Non-checkbox lines are kept as unchecked items so notes written by hand do
+ * not silently lose useful text.
+ */
 function parseChecklist(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -219,6 +242,9 @@ function checklistStats(items) {
   };
 }
 
+/**
+ * Reads the compact label frontmatter format: "Name|#color, Name 2|#color".
+ */
 function parseLabels(raw) {
   return String(raw || "")
     .split(",")
@@ -231,12 +257,22 @@ function parseLabels(raw) {
     .filter((label) => label.name);
 }
 
+/**
+ * Writes labels back to the same compact frontmatter format parseLabels reads.
+ */
 function labelsToFrontmatter(labels) {
   return (labels || [])
     .map((label) => `${textLine(label.name)}|${textLine(label.color || "#d43c35")}`)
     .join(", ");
 }
 
+/**
+ * Parses a Task Deck card note into the in-memory card fields.
+ *
+ * The parser is intentionally forgiving because users may edit these files by
+ * hand. Missing frontmatter fields return empty strings or nulls so callers can
+ * keep existing saved values when appropriate.
+ */
 function parseCardMarkdown(markdown) {
   const idMatch = markdown.match(/^kanban-card-id:\s*(.*)$/m);
   const boardMatch = markdown.match(/^kanban-board-id:\s*(.*)$/m);
@@ -302,6 +338,7 @@ module.exports = {
   "src/modals.js": function(module, exports, __require) {
 const { MarkdownRenderer, Modal, Notice, setIcon } = require("obsidian");
 
+// Modal UIs for cards, labels, dates, prompts, and the short about panel.
 const {
   DEFAULT_LABEL_COLOR,
   LABEL_COLORS,
@@ -320,6 +357,9 @@ const {
   textLine,
 } = __require("src/helpers.js");
 
+/**
+ * Small reusable text prompt for list names and other one-field actions.
+ */
 class TextPromptModal extends Modal {
   constructor(app, title, placeholder, initialValue, onSubmit) {
     super(app);
@@ -371,6 +411,12 @@ class TextPromptModal extends Modal {
   }
 }
 
+/**
+ * Label picker and label editor.
+ *
+ * The modal keeps local copies of global labels and selected labels, then sends
+ * both back through onChange so the card modal can save them together.
+ */
 class LabelPickerModal extends Modal {
   constructor(app, labels, selectedLabels, onChange) {
     super(app);
@@ -417,6 +463,9 @@ class LabelPickerModal extends Modal {
     this.render();
   }
 
+  /**
+   * Creates or updates a global label and keeps selected labels in sync.
+   */
   createLabel(name, color) {
     const cleanName = textLine(name);
     if (!cleanName) return;
@@ -599,6 +648,9 @@ class LabelPickerModal extends Modal {
   }
 }
 
+/**
+ * Compact start/due date picker for a single card.
+ */
 class CardDatesModal extends Modal {
   constructor(app, plugin, cardId) {
     super(app);
@@ -751,6 +803,9 @@ class CardDatesModal extends Modal {
     return actions;
   }
 
+  /**
+   * Applies the clicked calendar day to whichever date field is active.
+   */
   selectDate(date) {
     if (this.activeField === "start") {
       this.startDate = date;
@@ -763,6 +818,9 @@ class CardDatesModal extends Modal {
   }
 }
 
+/**
+ * Short in-app about panel with settings, sync, and close actions.
+ */
 class AboutModal extends Modal {
   constructor(app, plugin) {
     super(app);
@@ -800,6 +858,12 @@ class AboutModal extends Modal {
   }
 }
 
+/**
+ * Full card editor.
+ *
+ * Edits stay local until Save/Open note is clicked. That keeps Cancel simple
+ * and avoids writing partial checklist or details changes to the note file.
+ */
 class CardModal extends Modal {
   constructor(app, plugin, cardId) {
     super(app);
@@ -822,6 +886,9 @@ class CardModal extends Modal {
     });
   }
 
+  /**
+   * Pulls the latest Markdown note content before rendering the editor.
+   */
   async load() {
     const card = this.plugin.data.cards[this.cardId];
     if (!card) {
@@ -840,6 +907,9 @@ class CardModal extends Modal {
     this.render();
   }
 
+  /**
+   * Ensures labels found on a card are available in the modal's label picker.
+   */
   ensureLocalGlobalLabel(label) {
     const name = cleanLabelName(label);
     if (!name) return null;
@@ -942,6 +1012,9 @@ class CardModal extends Modal {
     return field;
   }
 
+  /**
+   * Shows rendered Markdown by default, with a textarea editor on demand.
+   */
   renderDetailsField() {
     const field = createElement("div", "ot-field");
     const header = createElement("div", "ot-field-row");
@@ -992,6 +1065,9 @@ class CardModal extends Modal {
     return field;
   }
 
+  /**
+   * Renders checklist items plus the progress bar used by the card badges.
+   */
   renderChecklistField() {
     const field = createElement("div", "ot-field");
     const header = createElement("div", "ot-checklist-header");
@@ -1103,6 +1179,9 @@ class CardModal extends Modal {
     return field;
   }
 
+  /**
+   * Sanitizes modal state and writes it through the plugin's card updater.
+   */
   async saveFromForm(titleInput) {
     if (this.detailsTextarea) this.localDetails = this.detailsTextarea.value;
 
@@ -1129,6 +1208,7 @@ module.exports = {
   "src/board-view.js": function(module, exports, __require) {
 const { ItemView, Menu, setIcon } = require("obsidian");
 
+// Renders the kanban board and handles inline card/list interactions.
 const {
   DONATION_URL,
   LIST_DRAG_TYPE,
@@ -1143,6 +1223,12 @@ const {
 } = __require("src/helpers.js");
 const { AboutModal, CardDatesModal, CardModal } = __require("src/modals.js");
 
+/**
+ * Obsidian view for the task board.
+ *
+ * This class owns rendering and short-lived UI state only. Persistent changes
+ * are delegated back to the plugin so board data and card notes remain synced.
+ */
 class BoardView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -1188,6 +1274,9 @@ class BoardView extends ItemView {
     this.contentEl.append(toolbar, scroller);
   }
 
+  /**
+   * Renders one column and wires list-level drag/drop targets.
+   */
   renderList(list) {
     const column = createElement("section", "ot-list");
     column.dataset.listId = list.id;
@@ -1317,6 +1406,10 @@ class BoardView extends ItemView {
     return form;
   }
 
+  /**
+   * Renders one card, including drag/drop, completion toggle, rename trigger,
+   * and compact metadata badges.
+   */
   renderCard(card, listId) {
     const element = createElement("article", "ot-card");
     const isRenaming = this.editingCardId === card.id;
@@ -1384,6 +1477,9 @@ class BoardView extends ItemView {
     return element;
   }
 
+  /**
+   * Inline title editor used by the card edit button.
+   */
   renderCardTitleEditor(card) {
     const form = createElement("form", "ot-card-title-form");
     const input = createElement("input", "ot-card-title-input");
@@ -1426,6 +1522,9 @@ class BoardView extends ItemView {
     return form;
   }
 
+  /**
+   * Builds the small date/checklist/details indicators shown on closed cards.
+   */
   renderCardMeta(card) {
     const meta = createElement("div", "ot-card-meta");
     const dates = dateRangeLabel(card.startDate, card.dueDate);
@@ -1507,8 +1606,12 @@ module.exports = { BoardView };
   "src/settings-tab.js": function(module, exports, __require) {
 const { Notice, PluginSettingTab, Setting } = require("obsidian");
 
+// Settings tab for board access, card-note sync, support, and version info.
 const { CARD_FOLDER, DONATION_URL } = __require("src/helpers.js");
 
+/**
+ * Obsidian settings tab for Task Deck.
+ */
 class TaskDeckSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -1541,7 +1644,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync card notes")
-      .setDesc("Import Markdown cards created manually or by AI inside the card folder.")
+      .setDesc("Import Markdown cards created outside the board inside the card folder.")
       .addButton((button) => {
         button
           .setButtonText("Sync now")
@@ -1573,6 +1676,7 @@ module.exports = { TaskDeckSettingTab };
   "src/plugin.js": function(module, exports, __require) {
 const { Notice, Plugin } = require("obsidian");
 
+// Owns the Obsidian plugin lifecycle, saved board data, and Markdown card sync.
 const {
   CARD_FOLDER,
   DEFAULT_DATA,
@@ -1592,6 +1696,13 @@ const { BoardView } = __require("src/board-view.js");
 const { TextPromptModal } = __require("src/modals.js");
 const { TaskDeckSettingTab } = __require("src/settings-tab.js");
 
+/**
+ * Main plugin controller.
+ *
+ * The board state is saved with Obsidian's plugin data API, while every card is
+ * mirrored as a Markdown note. UI code calls this class for all mutations so
+ * the JSON data and the Markdown files stay in sync.
+ */
 module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
   async onload() {
     await this.loadPluginData();
@@ -1626,6 +1737,10 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
+  /**
+   * Loads saved board data, normalizes older/missing fields, then imports any
+   * Markdown card notes that were created or edited outside the board.
+   */
   async loadPluginData() {
     const saved = await this.loadData();
     this.data = Object.assign(clone(DEFAULT_DATA), saved || {});
@@ -1650,6 +1765,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     return this.data.boards.find((board) => board.id === this.data.activeBoardId) || this.data.boards[0];
   }
 
+  /**
+   * Cleans duplicate labels by case-insensitive name while preserving color.
+   */
   normalizeGlobalLabels(labels) {
     const seen = new Set();
     return (labels || [])
@@ -1682,6 +1800,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     return cleanLabel;
   }
 
+  /**
+   * Normalizes a card's label list and registers every label globally.
+   */
   normalizeCardLabels(labels) {
     const seen = new Set();
     return (labels || [])
@@ -1713,6 +1834,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     return file && file.path && file.path.startsWith(`${CARD_FOLDER}/`) && file.extension === "md";
   }
 
+  /**
+   * Debounces vault events so a save/rename burst only triggers one rescan.
+   */
   queueCardFolderSync(file) {
     if (!this.isCardFile(file)) return;
 
@@ -1723,6 +1847,13 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }, 250);
   }
 
+  /**
+   * Imports Markdown files from CARD_FOLDER into the active board.
+   *
+   * Existing cards are matched first by frontmatter id, then by file path. When
+   * a note has no list id, it stays in its current list or falls back to the
+   * first list so manually-created notes still appear on the board.
+   */
   async syncCardsFromFolder() {
     const board = this.getBoard();
     if (!board.lists.length) board.lists.push({ id: uid("list"), title: "TODO", cardIds: [] });
@@ -1831,6 +1962,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
   }
 
+  /**
+   * Creates a card at the top of a list and immediately writes its note file.
+   */
   async createCard(listId, title) {
     const list = this.findList(listId);
     if (!list) return;
@@ -1858,6 +1992,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.refreshViews();
   }
 
+  /**
+   * Applies a card patch, including linked file renames when the title changes.
+   */
   async updateCard(cardId, patch, globalLabels) {
     const card = this.data.cards[cardId];
     if (!card) return;
@@ -1876,6 +2013,10 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.refreshViews();
   }
 
+  /**
+   * Moves a card between lists or before another card, then updates its note
+   * frontmatter with the new list id.
+   */
   async moveCard(cardId, targetListId, beforeCardId) {
     if (!cardId || cardId === beforeCardId) return;
     const targetList = this.findList(targetListId);
@@ -1924,6 +2065,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     await this.updateCard(cardId, { completed: !card.completed });
   }
 
+  /**
+   * Removes a card from all lists and trashes its linked Markdown note.
+   */
   async deleteCard(cardId, saveAndRefresh = true) {
     const card = this.data.cards[cardId];
     if (!card) return;
@@ -1942,6 +2086,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
   }
 
+  /**
+   * Refreshes a card from its Markdown note before opening the edit modal.
+   */
   async hydrateCardFromFile(card) {
     const file = this.app.vault.getAbstractFileByPath(card.filePath);
     if (!file || file.extension !== "md") return;
@@ -1974,6 +2121,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
   }
 
+  /**
+   * Finds a unique path in CARD_FOLDER, allowing the current path during rename.
+   */
   async nextCardPath(title, currentPath) {
     await this.ensureCardFolder();
 
@@ -1998,6 +2148,12 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     card.filePath = nextPath;
   }
 
+  /**
+   * Writes the card note used by both Obsidian and Task Deck.
+   *
+   * Frontmatter stores board metadata. The Details and Checklist sections stay
+   * as normal Markdown so users can edit card content directly in the vault.
+   */
   async writeCardFile(card) {
     await this.ensureCardFolder();
 

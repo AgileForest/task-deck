@@ -1,5 +1,6 @@
 const { MarkdownRenderer, Modal, Notice, setIcon } = require("obsidian");
 
+// Modal UIs for cards, labels, dates, prompts, and the short about panel.
 const {
   DEFAULT_LABEL_COLOR,
   LABEL_COLORS,
@@ -18,6 +19,9 @@ const {
   textLine,
 } = require("./helpers");
 
+/**
+ * Small reusable text prompt for list names and other one-field actions.
+ */
 class TextPromptModal extends Modal {
   constructor(app, title, placeholder, initialValue, onSubmit) {
     super(app);
@@ -69,6 +73,12 @@ class TextPromptModal extends Modal {
   }
 }
 
+/**
+ * Label picker and label editor.
+ *
+ * The modal keeps local copies of global labels and selected labels, then sends
+ * both back through onChange so the card modal can save them together.
+ */
 class LabelPickerModal extends Modal {
   constructor(app, labels, selectedLabels, onChange) {
     super(app);
@@ -115,6 +125,9 @@ class LabelPickerModal extends Modal {
     this.render();
   }
 
+  /**
+   * Creates or updates a global label and keeps selected labels in sync.
+   */
   createLabel(name, color) {
     const cleanName = textLine(name);
     if (!cleanName) return;
@@ -297,6 +310,9 @@ class LabelPickerModal extends Modal {
   }
 }
 
+/**
+ * Compact start/due date picker for a single card.
+ */
 class CardDatesModal extends Modal {
   constructor(app, plugin, cardId) {
     super(app);
@@ -449,6 +465,9 @@ class CardDatesModal extends Modal {
     return actions;
   }
 
+  /**
+   * Applies the clicked calendar day to whichever date field is active.
+   */
   selectDate(date) {
     if (this.activeField === "start") {
       this.startDate = date;
@@ -461,6 +480,9 @@ class CardDatesModal extends Modal {
   }
 }
 
+/**
+ * Short in-app about panel with settings, sync, and close actions.
+ */
 class AboutModal extends Modal {
   constructor(app, plugin) {
     super(app);
@@ -498,6 +520,12 @@ class AboutModal extends Modal {
   }
 }
 
+/**
+ * Full card editor.
+ *
+ * Edits stay local until Save/Open note is clicked. That keeps Cancel simple
+ * and avoids writing partial checklist or details changes to the note file.
+ */
 class CardModal extends Modal {
   constructor(app, plugin, cardId) {
     super(app);
@@ -520,6 +548,9 @@ class CardModal extends Modal {
     });
   }
 
+  /**
+   * Pulls the latest Markdown note content before rendering the editor.
+   */
   async load() {
     const card = this.plugin.data.cards[this.cardId];
     if (!card) {
@@ -538,6 +569,9 @@ class CardModal extends Modal {
     this.render();
   }
 
+  /**
+   * Ensures labels found on a card are available in the modal's label picker.
+   */
   ensureLocalGlobalLabel(label) {
     const name = cleanLabelName(label);
     if (!name) return null;
@@ -640,6 +674,9 @@ class CardModal extends Modal {
     return field;
   }
 
+  /**
+   * Shows rendered Markdown by default, with a textarea editor on demand.
+   */
   renderDetailsField() {
     const field = createElement("div", "ot-field");
     const header = createElement("div", "ot-field-row");
@@ -690,6 +727,9 @@ class CardModal extends Modal {
     return field;
   }
 
+  /**
+   * Renders checklist items plus the progress bar used by the card badges.
+   */
   renderChecklistField() {
     const field = createElement("div", "ot-field");
     const header = createElement("div", "ot-checklist-header");
@@ -801,6 +841,9 @@ class CardModal extends Modal {
     return field;
   }
 
+  /**
+   * Sanitizes modal state and writes it through the plugin's card updater.
+   */
   async saveFromForm(titleInput) {
     if (this.detailsTextarea) this.localDetails = this.detailsTextarea.value;
 

@@ -1,5 +1,6 @@
 const { setIcon } = require("obsidian");
 
+// Shared constants plus small pure helpers for dates, labels, Markdown, and DOM controls.
 const VIEW_TYPE = "obsidian-tasks-kanban-view";
 const CARD_FOLDER = "Kanban Cards";
 const LIST_DRAG_TYPE = "application/x-obsidian-tasks-kanban-list";
@@ -14,6 +15,13 @@ const LABEL_COLORS = [
   "#68a0ee", "#70c1d8", "#96c949", "#dc6ab5", "#a3a6aa",
 ];
 
+/**
+ * Minimal saved-data shape used when the plugin starts with no existing board.
+ *
+ * Cards are stored in a top-level map and lists keep card ids. This makes
+ * moving cards between lists cheap while still letting each card have one
+ * Markdown file on disk.
+ */
 const DEFAULT_DATA = {
   version: 1,
   activeBoardId: "default",
@@ -40,6 +48,9 @@ function textLine(value) {
   return String(value || "").replace(/\r?\n/g, " ").trim();
 }
 
+/**
+ * Accepts only the storage format used in card frontmatter: YYYY-MM-DD.
+ */
 function cleanDate(value) {
   const date = textLine(value);
   return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : "";
@@ -103,6 +114,9 @@ function cleanLabelName(label) {
   return name === "---" ? "" : name;
 }
 
+/**
+ * Builds a vault-safe card filename from a title.
+ */
 function slugify(value) {
   const slug = String(value || "card")
     .normalize("NFD")
@@ -157,6 +171,9 @@ function textButton(icon, label, onClick) {
   return button;
 }
 
+/**
+ * Reads a second-level Markdown section body, stopping before the next H2.
+ */
 function getSection(markdown, heading) {
   const marker = `## ${heading}`;
   const start = markdown.indexOf(marker);
@@ -175,6 +192,12 @@ function getSectionAny(markdown, headings) {
   return "";
 }
 
+/**
+ * Converts Markdown checklist lines into the card checklist model.
+ *
+ * Non-checkbox lines are kept as unchecked items so notes written by hand do
+ * not silently lose useful text.
+ */
 function parseChecklist(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -216,6 +239,9 @@ function checklistStats(items) {
   };
 }
 
+/**
+ * Reads the compact label frontmatter format: "Name|#color, Name 2|#color".
+ */
 function parseLabels(raw) {
   return String(raw || "")
     .split(",")
@@ -228,12 +254,22 @@ function parseLabels(raw) {
     .filter((label) => label.name);
 }
 
+/**
+ * Writes labels back to the same compact frontmatter format parseLabels reads.
+ */
 function labelsToFrontmatter(labels) {
   return (labels || [])
     .map((label) => `${textLine(label.name)}|${textLine(label.color || "#d43c35")}`)
     .join(", ");
 }
 
+/**
+ * Parses a Task Deck card note into the in-memory card fields.
+ *
+ * The parser is intentionally forgiving because users may edit these files by
+ * hand. Missing frontmatter fields return empty strings or nulls so callers can
+ * keep existing saved values when appropriate.
+ */
 function parseCardMarkdown(markdown) {
   const idMatch = markdown.match(/^kanban-card-id:\s*(.*)$/m);
   const boardMatch = markdown.match(/^kanban-board-id:\s*(.*)$/m);

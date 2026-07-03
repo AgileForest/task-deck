@@ -1,7 +1,11 @@
 const { Notice, PluginSettingTab, Setting } = require("obsidian");
 
+// Settings tab for board access, card-note sync, support, and version info.
 const { CARD_FOLDER, DONATION_URL } = require("./helpers");
 
+/**
+ * Obsidian settings tab for Task Deck.
+ */
 class TaskDeckSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -34,7 +38,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync card notes")
-      .setDesc("Import Markdown cards created manually or by AI inside the card folder.")
+      .setDesc("Import Markdown cards created outside the board inside the card folder.")
       .addButton((button) => {
         button
           .setButtonText("Sync now")

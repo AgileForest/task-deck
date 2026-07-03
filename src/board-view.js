@@ -1,5 +1,6 @@
 const { ItemView, Menu, setIcon } = require("obsidian");
 
+// Renders the kanban board and handles inline card/list interactions.
 const {
   DONATION_URL,
   LIST_DRAG_TYPE,
@@ -14,6 +15,12 @@ const {
 } = require("./helpers");
 const { AboutModal, CardDatesModal, CardModal } = require("./modals");
 
+/**
+ * Obsidian view for the task board.
+ *
+ * This class owns rendering and short-lived UI state only. Persistent changes
+ * are delegated back to the plugin so board data and card notes remain synced.
+ */
 class BoardView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -59,6 +66,9 @@ class BoardView extends ItemView {
     this.contentEl.append(toolbar, scroller);
   }
 
+  /**
+   * Renders one column and wires list-level drag/drop targets.
+   */
   renderList(list) {
     const column = createElement("section", "ot-list");
     column.dataset.listId = list.id;
@@ -188,6 +198,10 @@ class BoardView extends ItemView {
     return form;
   }
 
+  /**
+   * Renders one card, including drag/drop, completion toggle, rename trigger,
+   * and compact metadata badges.
+   */
   renderCard(card, listId) {
     const element = createElement("article", "ot-card");
     const isRenaming = this.editingCardId === card.id;
@@ -255,6 +269,9 @@ class BoardView extends ItemView {
     return element;
   }
 
+  /**
+   * Inline title editor used by the card edit button.
+   */
   renderCardTitleEditor(card) {
     const form = createElement("form", "ot-card-title-form");
     const input = createElement("input", "ot-card-title-input");
@@ -297,6 +314,9 @@ class BoardView extends ItemView {
     return form;
   }
 
+  /**
+   * Builds the small date/checklist/details indicators shown on closed cards.
+   */
   renderCardMeta(card) {
     const meta = createElement("div", "ot-card-meta");
     const dates = dateRangeLabel(card.startDate, card.dueDate);

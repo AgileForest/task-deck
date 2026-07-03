@@ -1,5 +1,6 @@
 const { Notice, Plugin } = require("obsidian");
 
+// Owns the Obsidian plugin lifecycle, saved board data, and Markdown card sync.
 const {
   CARD_FOLDER,
   DEFAULT_DATA,
@@ -19,6 +20,13 @@ const { BoardView } = require("./board-view");
 const { TextPromptModal } = require("./modals");
 const { TaskDeckSettingTab } = require("./settings-tab");
 
+/**
+ * Main plugin controller.
+ *
+ * The board state is saved with Obsidian's plugin data API, while every card is
+ * mirrored as a Markdown note. UI code calls this class for all mutations so
+ * the JSON data and the Markdown files stay in sync.
+ */
 module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
   async onload() {
     await this.loadPluginData();
@@ -53,6 +61,10 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
+  /**
+   * Loads saved board data, normalizes older/missing fields, then imports any
+   * Markdown card notes that were created or edited outside the board.
+   */
   async loadPluginData() {
     const saved = await this.loadData();
     this.data = Object.assign(clone(DEFAULT_DATA), saved || {});
@@ -77,6 +89,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     return this.data.boards.find((board) => board.id === this.data.activeBoardId) || this.data.boards[0];
   }
 
+  /**
+   * Cleans duplicate labels by case-insensitive name while preserving color.
+   */
   normalizeGlobalLabels(labels) {
     const seen = new Set();
     return (labels || [])
@@ -109,6 +124,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     return cleanLabel;
   }
 
+  /**
+   * Normalizes a card's label list and registers every label globally.
+   */
   normalizeCardLabels(labels) {
     const seen = new Set();
     return (labels || [])
@@ -140,6 +158,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     return file && file.path && file.path.startsWith(`${CARD_FOLDER}/`) && file.extension === "md";
   }
 
+  /**
+   * Debounces vault events so a save/rename burst only triggers one rescan.
+   */
   queueCardFolderSync(file) {
     if (!this.isCardFile(file)) return;
 
@@ -150,6 +171,13 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }, 250);
   }
 
+  /**
+   * Imports Markdown files from CARD_FOLDER into the active board.
+   *
+   * Existing cards are matched first by frontmatter id, then by file path. When
+   * a note has no list id, it stays in its current list or falls back to the
+   * first list so manually-created notes still appear on the board.
+   */
   async syncCardsFromFolder() {
     const board = this.getBoard();
     if (!board.lists.length) board.lists.push({ id: uid("list"), title: "TODO", cardIds: [] });
@@ -258,6 +286,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
   }
 
+  /**
+   * Creates a card at the top of a list and immediately writes its note file.
+   */
   async createCard(listId, title) {
     const list = this.findList(listId);
     if (!list) return;
@@ -285,6 +316,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.refreshViews();
   }
 
+  /**
+   * Applies a card patch, including linked file renames when the title changes.
+   */
   async updateCard(cardId, patch, globalLabels) {
     const card = this.data.cards[cardId];
     if (!card) return;
@@ -303,6 +337,10 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.refreshViews();
   }
 
+  /**
+   * Moves a card between lists or before another card, then updates its note
+   * frontmatter with the new list id.
+   */
   async moveCard(cardId, targetListId, beforeCardId) {
     if (!cardId || cardId === beforeCardId) return;
     const targetList = this.findList(targetListId);
@@ -351,6 +389,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     await this.updateCard(cardId, { completed: !card.completed });
   }
 
+  /**
+   * Removes a card from all lists and trashes its linked Markdown note.
+   */
   async deleteCard(cardId, saveAndRefresh = true) {
     const card = this.data.cards[cardId];
     if (!card) return;
@@ -369,6 +410,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
   }
 
+  /**
+   * Refreshes a card from its Markdown note before opening the edit modal.
+   */
   async hydrateCardFromFile(card) {
     const file = this.app.vault.getAbstractFileByPath(card.filePath);
     if (!file || file.extension !== "md") return;
@@ -401,6 +445,9 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
   }
 
+  /**
+   * Finds a unique path in CARD_FOLDER, allowing the current path during rename.
+   */
   async nextCardPath(title, currentPath) {
     await this.ensureCardFolder();
 
@@ -425,6 +472,12 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     card.filePath = nextPath;
   }
 
+  /**
+   * Writes the card note used by both Obsidian and Task Deck.
+   *
+   * Frontmatter stores board metadata. The Details and Checklist sections stay
+   * as normal Markdown so users can edit card content directly in the vault.
+   */
   async writeCardFile(card) {
     await this.ensureCardFolder();
 

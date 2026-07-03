@@ -1,6 +1,12 @@
 const fs = require("fs");
 const path = require("path");
 
+/**
+ * Tiny CommonJS bundler for Obsidian releases.
+ *
+ * It keeps development files split under src/ while producing the single
+ * main.js file Obsidian loads from an installed plugin folder.
+ */
 const ROOT = __dirname;
 const ENTRY = "src/plugin.js";
 const OUTFILE = "main.js";

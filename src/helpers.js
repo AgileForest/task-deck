@@ -59,6 +59,9 @@ const DEFAULT_NEXTCLOUD = {
   // Attachments are Phase 2 territory; the toggle is here so the data schema
   // is stable now and settings can flip it once implemented.
   attachmentsEnabled: false,
+  // Cards deleted locally that still need their remote counterpart torn down
+  // on the next push. Shape: [{ remoteId, boardRemoteId, stackRemoteId, at }].
+  pendingDeletions: [],
 };
 
 const DEFAULT_DATA = {

@@ -149,7 +149,10 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       if (card.remoteId === undefined) card.remoteId = null;
       if (card.etag === undefined) card.etag = null;
       if (card.remoteUpdatedAt === undefined) card.remoteUpdatedAt = 0;
-      if (card.baselineHash === undefined) card.baselineHash = null;
+      // Migration: v0.4.0 stored a hash; M3 replaced it with a per-field baseline
+      // snapshot. Drop the old scalar so 3-way diffs start from a clean slate.
+      if (card.baselineHash !== undefined) delete card.baselineHash;
+      if (card.baseline === undefined) card.baseline = null;
       if (card.localDirty === undefined) card.localDirty = false;
     });
     this.data.boards.forEach((board) => {
@@ -310,6 +313,40 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.syncLog.push(Object.assign({ at: Date.now() }, event));
     // Cap the buffer so a chatty sync never balloons memory.
     if (this.syncLog.length > 200) this.syncLog.splice(0, this.syncLog.length - 200);
+  }
+
+  /**
+   * Flag a card as having local edits that still need to be pushed. Cards that
+   * were never linked to a remote board (no boardBinding) are still marked —
+   * the sync manager will decide whether the board is tracked before acting.
+   */
+  markCardDirty(card) {
+    if (!card) return;
+    card.localDirty = true;
+    card.updatedAt = new Date().toISOString();
+  }
+
+  /**
+   * Record a card deletion so the next push can tear it down on Nextcloud. No-op
+   * when the card was never synced (`remoteId` is null): local-only cards need
+   * no remote cleanup.
+   */
+  enqueueCardDeletion(card) {
+    if (!card || card.remoteId == null) return;
+    const board = this.data.boards.find((b) => b.id === card.boardId);
+    if (!board || board.remoteId == null) return;
+    const list = board.lists.find((l) => l.id === card.listId);
+    if (!list || list.remoteId == null) return;
+    const nc = this.data.nextcloud;
+    if (!Array.isArray(nc.pendingDeletions)) nc.pendingDeletions = [];
+    // Dedupe so a rapid create/delete cycle doesn't stack duplicates.
+    if (nc.pendingDeletions.some((entry) => entry.remoteId === card.remoteId)) return;
+    nc.pendingDeletions.push({
+      remoteId: card.remoteId,
+      boardRemoteId: board.remoteId,
+      stackRemoteId: list.remoteId,
+      at: Date.now(),
+    });
   }
 
   /**
@@ -1146,6 +1183,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
 
     this.data.cards[card.id] = card;
     list.cardIds.unshift(card.id);
+    this.markCardDirty(card);
     // Inserting at the top shifts every other card's index, so rewrite the whole
     // list's files to keep their `position` frontmatter in sync (not just the new
     // card) — otherwise the new order wouldn't propagate to other devices.
@@ -1171,6 +1209,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       await this.renameCardFile(card, patch.title);
     }
     Object.assign(card, patch, { updatedAt: new Date().toISOString() });
+    this.markCardDirty(card);
     await this.writeCardFile(card);
     await this.savePluginData();
     this.refreshViews();
@@ -1203,6 +1242,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
 
     card.boardId = targetBoard.id;
     card.listId = targetListId;
+    this.markCardDirty(card);
     // Persist the new order: rewrite every card in the affected list(s) so their
     // `position` frontmatter reflects the new order and syncs to other devices.
     await this.writeListCardFiles(targetList);
@@ -1270,6 +1310,8 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
   async deleteCard(cardId, saveAndRefresh = true) {
     const card = this.data.cards[cardId];
     if (!card) return;
+
+    this.enqueueCardDeletion(card);
 
     this.data.boards.forEach((board) => board.lists.forEach((list) => {
       list.cardIds = list.cardIds.filter((id) => id !== cardId);

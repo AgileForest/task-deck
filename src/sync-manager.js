@@ -2,17 +2,26 @@ const {
   remoteBoardToLocal,
   reconcileBoardStructure,
   mergeRemoteCardOntoLocal,
+  localCardToDeckPatch,
+  localCardToDeckCreate,
+  remoteCardToLocal,
 } = require("./sync-mapper");
 const { DeckApiError } = require("./deck-client");
+const { detectFieldConflicts, applyPolicy, snapshotBaseline } = require("./conflict");
+const { ConflictModal } = require("./conflict-modal");
 
-// Coordinates read-only pulls from Nextcloud Deck. Writes (M3) will land here
-// as well so the plugin only needs one entry point (`runSync`) regardless of
-// direction.
+// Coordinates two-way sync with Nextcloud Deck.
 //
-// The manager is stateful only in memory: `this.status` tracks the last run,
-// while persistent bindings (localBoardId ↔ remoteBoardId) live in
-// `plugin.data.nextcloud.boardBindings` so a restart still knows which local
-// board mirrors which remote one.
+// `runSync` executes three phases in a single "tick":
+//   1. Pull:  fetch remote state, reconcile boards/stacks, merge remote cards
+//             onto local ones (respecting `localDirty`).
+//   2. Push:  for every dirty local card, compute a 3-way field diff against
+//             the freshly pulled remote and either auto-apply or prompt the
+//             user based on the configured conflict policy.
+//   3. Reap:  drain the pending deletions queue.
+//
+// The manager coalesces concurrent triggers (`this.running`) so a manual
+// button press during a scheduled tick is a no-op.
 
 const STATUS_IDLE = "idle";
 const STATUS_RUNNING = "running";
@@ -23,96 +32,115 @@ class SyncManager {
   constructor(plugin) {
     this.plugin = plugin;
     this.status = { state: STATUS_IDLE, at: 0, message: "" };
-    this.running = null; // in-flight promise so concurrent calls coalesce
+    this.running = null;
   }
 
   getStatus() { return this.status; }
 
-  /**
-   * Kick off (or join) a pull. Always resolves — errors are surfaced through
-   * `this.status.state === "error"` so callers can render a badge instead of
-   * having to catch.
-   */
   async runPull({ manual = false } = {}) {
+    return this.runSync({ manual });
+  }
+
+  async runSync({ manual = false } = {}) {
     if (this.running) return this.running;
-    this.running = this.pullOnce({ manual }).finally(() => { this.running = null; });
+    this.running = this.syncOnce({ manual }).finally(() => { this.running = null; });
     return this.running;
   }
 
-  async pullOnce({ manual }) {
+  async syncOnce({ manual }) {
     const client = await this.plugin.getDeckClient();
     if (!client) {
       this.status = { state: STATUS_ERROR, at: Date.now(), message: "Nextcloud is not connected." };
       return this.status;
     }
-    this.status = { state: STATUS_RUNNING, at: Date.now(), message: manual ? "Manual pull…" : "Pulling from Nextcloud…" };
+    this.status = { state: STATUS_RUNNING, at: Date.now(), message: manual ? "Syncing…" : "Background sync…" };
 
     try {
+      // ---- Phase 1: Pull ----------------------------------------------------
       const { data: remoteBoards } = await client.getBoards();
       if (!Array.isArray(remoteBoards)) throw new Error("Unexpected boards response.");
 
       const bindings = this.getBindings();
       const boardMap = new Map(this.plugin.data.boards.map((board) => [board.id, board]));
       const boundLocalIds = new Set();
+      const boardContext = new Map(); // localBoardId -> { remoteBoard, remoteStacks }
 
       for (const remoteBoard of remoteBoards) {
         const localBoardId = this.findOrBindLocalBoard(remoteBoard, bindings, boardMap);
         boundLocalIds.add(localBoardId);
-        await this.pullBoard(client, remoteBoard, localBoardId);
+        const remoteStacks = await this.pullBoard(client, remoteBoard, localBoardId);
+        boardContext.set(localBoardId, { remoteBoard, remoteStacks });
       }
 
       this.plugin.data.nextcloud.boardBindings = bindings;
+
+      // ---- Phase 2: Push ---------------------------------------------------
+      let pushed = 0;
+      let conflicts = 0;
+      for (const [localBoardId, ctx] of boardContext.entries()) {
+        const localBoard = this.plugin.data.boards.find((b) => b.id === localBoardId);
+        if (!localBoard) continue;
+        const result = await this.pushBoard(client, localBoard, ctx);
+        pushed += result.pushed;
+        conflicts += result.conflicts;
+      }
+
+      // ---- Phase 3: Reap deletions ----------------------------------------
+      const reaped = await this.reapDeletions(client);
+
       this.plugin.data.nextcloud.lastSyncAt = Date.now();
       await this.plugin.savePluginData();
       this.plugin.refreshViews();
-      this.status = {
-        state: STATUS_OK,
-        at: Date.now(),
-        message: `Pulled ${remoteBoards.length} board${remoteBoards.length === 1 ? "" : "s"}.`,
-      };
+
+      const parts = [`Pulled ${remoteBoards.length} board${remoteBoards.length === 1 ? "" : "s"}`];
+      if (pushed) parts.push(`pushed ${pushed} card${pushed === 1 ? "" : "s"}`);
+      if (reaped) parts.push(`deleted ${reaped} remote card${reaped === 1 ? "" : "s"}`);
+      if (conflicts) parts.push(`${conflicts} conflict${conflicts === 1 ? "" : "s"} skipped`);
+
+      this.status = { state: STATUS_OK, at: Date.now(), message: `${parts.join(", ")}.` };
     } catch (error) {
       const message = error instanceof DeckApiError
         ? `Deck API ${error.status || "error"}: ${error.message}`
         : (error && error.message) || String(error);
       this.status = { state: STATUS_ERROR, at: Date.now(), message };
-      this.plugin.pushSyncLog({ event: "pull-failed", message });
+      this.plugin.pushSyncLog({ event: "sync-failed", message });
     }
     return this.status;
   }
 
-  // ---- Board-level pull ---------------------------------------------------
+  // ---- Pull ---------------------------------------------------------------
 
   async pullBoard(client, remoteBoard, localBoardId) {
     const localBoard = this.plugin.data.boards.find((board) => board.id === localBoardId);
     if (!localBoard) {
-      // Freshly minted binding — build the board from scratch.
       const { data: stacks } = await client.getStacks(remoteBoard.id);
-      const created = remoteBoardToLocal(remoteBoard, stacks || [], { boardId: localBoardId, folderPath: this.suggestFolder(remoteBoard) });
+      const created = remoteBoardToLocal(remoteBoard, stacks || [], {
+        boardId: localBoardId,
+        folderPath: this.suggestFolder(remoteBoard),
+      });
       this.plugin.data.boards.push(created);
       await this.pullCards(client, remoteBoard.id, created, stacks || []);
-      return;
+      return stacks || [];
     }
 
-    // Existing board: only refresh stack structure + cards.
     const { data: stacks } = await client.getStacks(remoteBoard.id);
     const reconciled = reconcileBoardStructure(localBoard, remoteBoard, stacks || []);
-    // Splice-replace to preserve reference identity of the boards array
     const index = this.plugin.data.boards.indexOf(localBoard);
     this.plugin.data.boards[index] = reconciled;
     await this.pullCards(client, remoteBoard.id, reconciled, stacks || []);
+    return stacks || [];
   }
 
   async pullCards(client, remoteBoardId, localBoard, remoteStacks) {
-    // Deck's `getStacks` already returns cards as an embedded array on each
-    // stack; we prefer that over N follow-up requests. Fall back to a per-card
-    // GET only when the embedded array is missing (older Deck versions).
-    const cardMap = new Map(); // remoteCardId -> existing local card
+    const cardMap = new Map();
     Object.values(this.plugin.data.cards).forEach((card) => {
       if (card.boardId === localBoard.id && card.remoteId != null) cardMap.set(card.remoteId, card);
     });
 
-    // Reset card lists — we rebuild them from the remote order.
-    localBoard.lists.forEach((list) => { list.cardIds = []; });
+    // Track which lists were rebuilt so we can preserve the ordering of any
+    // local-only (unsynced) cards on the same list.
+    const rebuiltListIds = new Set();
+    localBoard.lists.forEach((list) => { rebuiltListIds.add(list.id); list.cardIds = []; });
 
     for (const stack of remoteStacks) {
       const localList = localBoard.lists.find((list) => list.remoteId === stack.id);
@@ -136,24 +164,160 @@ class SyncManager {
       }
     }
 
-    // Cards left in `cardMap` were on Nextcloud last time but not now. For M2
-    // (read-only) we remove them locally — this matches the "Nextcloud is the
-    // source of truth for tracked cards" model. Cards without a remoteId are
-    // untouched.
+    // Cards left in `cardMap` used to be on Nextcloud but no longer are; drop
+    // them locally so Deck stays authoritative for tracked cards.
     cardMap.forEach((orphan) => {
-      if (orphan.boardId === localBoard.id) {
-        delete this.plugin.data.cards[orphan.id];
-      }
+      if (orphan.boardId === localBoard.id) delete this.plugin.data.cards[orphan.id];
+    });
+
+    // Fold local-only (never synced) cards back into their list. They stayed
+    // in this.plugin.data.cards but were dropped from cardIds when we cleared
+    // the lists above.
+    Object.values(this.plugin.data.cards).forEach((card) => {
+      if (card.boardId !== localBoard.id) return;
+      if (card.remoteId != null) return;
+      const list = localBoard.lists.find((l) => l.id === card.listId);
+      if (list && !list.cardIds.includes(card.id)) list.cardIds.push(card.id);
     });
   }
 
   async fallbackFetchStackCards(client, boardId, stackId) {
-    // Not all Deck versions embed cards; if we ever hit that, iterate what the
-    // stack payload gave us (may still be empty), and let the sync log surface
-    // the shortfall. A real per-card fetch would need a card index which the
-    // Deck API doesn't expose without an extra call chain; keep it minimal.
     this.plugin.pushSyncLog({ event: "stack-embed-missing", boardId, stackId });
     return [];
+  }
+
+  // ---- Push ---------------------------------------------------------------
+
+  async pushBoard(client, localBoard, { remoteBoard, remoteStacks }) {
+    let pushed = 0;
+    let conflicts = 0;
+    const policy = this.plugin.data.nextcloud.conflictPolicy || "prompt";
+    const remoteCardIndex = buildRemoteCardIndex(remoteStacks);
+
+    // Snapshot the card list first — pushing mutates data.cards, and we don't
+    // want to iterate while modifying.
+    const dirtyCards = Object.values(this.plugin.data.cards)
+      .filter((card) => card.boardId === localBoard.id && card.localDirty);
+
+    for (const card of dirtyCards) {
+      const listBinding = localBoard.lists.find((l) => l.id === card.listId);
+      if (!listBinding || listBinding.remoteId == null) {
+        // The card lives on a list that isn't bound to a remote stack yet.
+        // Creating stacks on-demand is out of scope for M3; log and skip.
+        this.plugin.pushSyncLog({ event: "push-skip-unbound-list", cardId: card.id });
+        continue;
+      }
+
+      try {
+        if (card.remoteId == null) {
+          await this.pushCreate(client, localBoard, listBinding, card);
+          pushed += 1;
+          continue;
+        }
+        const remoteSnapshot = remoteCardIndex.get(card.remoteId);
+        const outcome = await this.pushUpdate(client, localBoard, listBinding, card, remoteSnapshot, policy);
+        if (outcome === "pushed") pushed += 1;
+        else if (outcome === "conflict-skipped") conflicts += 1;
+      } catch (error) {
+        this.plugin.pushSyncLog({
+          event: "push-failed",
+          cardId: card.id,
+          message: (error && error.message) || String(error),
+        });
+      }
+    }
+
+    return { pushed, conflicts };
+  }
+
+  async pushCreate(client, localBoard, list, card) {
+    const payload = localCardToDeckCreate(card, { owner: this.plugin.data.nextcloud.username });
+    const { data: created } = await client.createCard(remoteBoard(localBoard), list.remoteId, payload);
+    if (!created) throw new Error("Empty response from createCard");
+    this.applyRemoteToCard(card, created, localBoard.id, list.id);
+    card.localDirty = false;
+  }
+
+  async pushUpdate(client, localBoard, list, card, remoteSnapshot, policy) {
+    // If the remote counterpart is gone, treat this as a create.
+    if (!remoteSnapshot) {
+      await this.pushCreate(client, localBoard, list, card);
+      return "pushed";
+    }
+
+    const remoteView = remoteCardToLocal(remoteSnapshot, { boardId: localBoard.id, listId: list.id });
+    const baseline = card.baseline || null;
+    const diff = detectFieldConflicts(baseline, card, remoteView);
+
+    // If the remote has autoApplied fields, fold them into the local card so
+    // the push payload we send back is a full merge (Deck's PUT replaces the
+    // whole record).
+    Object.entries(diff.autoApplied).forEach(([field, value]) => {
+      if (Object.prototype.hasOwnProperty.call(card, field)) card[field] = value;
+    });
+
+    if (diff.conflicts.length) {
+      const { resolved, stillOpen } = applyPolicy(policy, diff.conflicts, {
+        localUpdatedAt: card.remoteUpdatedAt,
+        remoteUpdatedAt: remoteView.remoteUpdatedAt,
+      });
+      Object.entries(resolved).forEach(([field, value]) => { card[field] = value; });
+
+      if (stillOpen.length) {
+        // Only `prompt` policy leaves fields open; ask the user.
+        const modal = new ConflictModal(this.plugin.app, {
+          cardTitle: card.title,
+          conflicts: stillOpen,
+        });
+        const answer = await modal.await();
+        if (!answer) return "conflict-skipped";
+        Object.entries(answer).forEach(([field, value]) => { card[field] = value; });
+      }
+    }
+
+    const payload = localCardToDeckPatch(card, { owner: this.plugin.data.nextcloud.username });
+    const board = remoteBoard(localBoard);
+    const { data: updated } = await client.updateCard(board, list.remoteId, card.remoteId, payload);
+    if (!updated) throw new Error("Empty response from updateCard");
+    this.applyRemoteToCard(card, updated, localBoard.id, list.id);
+    card.localDirty = false;
+    return "pushed";
+  }
+
+  applyRemoteToCard(card, remoteResp, boardId, listId) {
+    const remote = remoteCardToLocal(remoteResp, { boardId, listId });
+    card.remoteId = remote.remoteId;
+    card.etag = remote.etag;
+    card.remoteUpdatedAt = remote.remoteUpdatedAt;
+    // After a successful push, the *local* state is now the truth for the
+    // baseline. Fields we didn't touch on Deck (checklist etc.) came back
+    // unchanged, so hashing what we have is safe.
+    card.baseline = snapshotBaseline(card);
+  }
+
+  // ---- Reap ---------------------------------------------------------------
+
+  async reapDeletions(client) {
+    const nc = this.plugin.data.nextcloud;
+    if (!Array.isArray(nc.pendingDeletions) || !nc.pendingDeletions.length) return 0;
+    const remaining = [];
+    let removed = 0;
+    for (const entry of nc.pendingDeletions) {
+      try {
+        await client.deleteCard(entry.boardRemoteId, entry.stackRemoteId, entry.remoteId);
+        removed += 1;
+      } catch (error) {
+        // 404 means it's already gone — accept that as success.
+        if (error instanceof DeckApiError && error.status === 404) {
+          removed += 1;
+        } else {
+          this.plugin.pushSyncLog({ event: "reap-failed", entry, message: (error && error.message) || String(error) });
+          remaining.push(entry);
+        }
+      }
+    }
+    nc.pendingDeletions = remaining;
+    return removed;
   }
 
   // ---- Bindings -----------------------------------------------------------
@@ -167,8 +331,6 @@ class SyncManager {
     for (const [localId, remoteId] of Object.entries(bindings)) {
       if (Number(remoteId) === Number(remoteBoard.id) && boardMap.get(localId)) return localId;
     }
-    // Try to reuse an existing local board with the same name (helpful when
-    // the user set both sides up manually before signing in).
     const nameMatch = this.plugin.data.boards.find(
       (board) => !bindings[board.id] && board.name && board.name.trim() === String(remoteBoard.title || "").trim(),
     );
@@ -176,19 +338,32 @@ class SyncManager {
       bindings[nameMatch.id] = remoteBoard.id;
       return nameMatch.id;
     }
-    // Otherwise reserve a fresh local id — the board itself is materialised
-    // by `pullBoard` below.
     const created = `board-${remoteBoard.id}`;
     bindings[created] = remoteBoard.id;
     return created;
   }
 
   suggestFolder(remoteBoard) {
-    // Simple, deterministic folder placement: Nextcloud Deck/<title>. The user
-    // can rename the folder afterwards; the binding table keeps the mapping.
     const title = String(remoteBoard.title || "Board").replace(/[\\/:*?"<>|]/g, " ").trim() || "Board";
     return `Nextcloud Deck/${title}`;
   }
+}
+
+// ---- Local helpers --------------------------------------------------------
+
+function remoteBoard(localBoard) {
+  if (localBoard.remoteId == null) throw new Error("Board is not linked to Nextcloud yet.");
+  return localBoard.remoteId;
+}
+
+function buildRemoteCardIndex(remoteStacks) {
+  const index = new Map();
+  (remoteStacks || []).forEach((stack) => {
+    (stack.cards || []).forEach((card) => {
+      if (card && card.id != null) index.set(card.id, card);
+    });
+  });
+  return index;
 }
 
 module.exports = {

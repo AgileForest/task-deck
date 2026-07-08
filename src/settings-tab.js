@@ -170,21 +170,21 @@ class TaskDeckSettingTab extends PluginSettingTab {
           });
       });
 
-    // Pull-now + last-sync status. `runNextcloudSync` never rejects; it
+    // Sync-now + last-sync status. `runNextcloudSync` never rejects; it
     // reports through the sync manager's status object.
     const statusEl = containerEl.createEl("div", { cls: "ot-settings-inline-status" });
     statusEl.setText(this.formatSyncStatus(nextcloud));
 
     new Setting(containerEl)
-      .setName("Pull from Nextcloud")
-      .setDesc("Fetch remote boards, stacks, and cards. Read-only for now — pushes arrive in M3.")
+      .setName("Sync with Nextcloud")
+      .setDesc("Two-way sync: pulls remote changes, pushes local edits, then removes cards deleted locally.")
       .addButton((button) => {
         button
-          .setButtonText("Pull now")
+          .setButtonText("Sync now")
           .setCta()
           .onClick(async () => {
             button.setDisabled(true);
-            statusEl.setText("Pulling from Nextcloud…");
+            statusEl.setText("Syncing…");
             const result = await this.plugin.runNextcloudSync({ manual: true });
             statusEl.setText(this.formatSyncStatus(this.plugin.data.nextcloud, result));
             button.setDisabled(false);
@@ -312,8 +312,8 @@ class TaskDeckSettingTab extends PluginSettingTab {
 
   formatSyncStatus(nextcloud, override) {
     const status = override || (this.plugin.syncManager && this.plugin.syncManager.getStatus()) || null;
-    if (status && status.state === "running") return status.message || "Pulling…";
-    if (status && status.state === "error") return `Pull failed: ${status.message}`;
+    if (status && status.state === "running") return status.message || "Syncing…";
+    if (status && status.state === "error") return `Sync failed: ${status.message}`;
     const last = Number((nextcloud && nextcloud.lastSyncAt) || (status && status.at) || 0);
     if (!last) return "No sync yet.";
     return `Last sync: ${new Date(last).toLocaleString()}`;

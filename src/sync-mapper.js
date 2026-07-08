@@ -1,4 +1,5 @@
 const { uid, cleanColor, cleanDate } = require("./helpers");
+const { snapshotBaseline } = require("./conflict");
 
 // Nextcloud Deck ↔ local board model translators.
 //
@@ -50,12 +51,12 @@ function remoteCardToLocal(remoteCard, { boardId, listId }) {
         .filter((a) => a && a.email)
     : [];
 
-  return {
+  const card = {
     id: uid("card"),
     remoteId: remoteCard.id ?? null,
     etag: remoteCard.ETag || null,
     remoteUpdatedAt: remoteCard.lastModified || 0,
-    baselineHash: null, // populated by sync-manager once the description hash is computed
+    baseline: null, // filled in below after we know the final field values
     localDirty: false,
     boardId,
     listId,
@@ -70,6 +71,8 @@ function remoteCardToLocal(remoteCard, { boardId, listId }) {
     filePath: "", // assigned when the note is written to the vault
     position: typeof remoteCard.order === "number" ? remoteCard.order : null,
   };
+  card.baseline = snapshotBaseline(card);
+  return card;
 }
 
 /**
@@ -90,8 +93,9 @@ function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId }) {
   merged.position = remote.position;
 
   // Only overwrite user-editable fields when the local copy has no unsynced
-  // changes. This is intentionally coarse for M2 (read-only pull); M3 will
-  // upgrade to field-level three-way merge with baselineHash.
+  // changes. Field-level three-way merges live in sync-manager (M3+) which
+  // will hand us a resolved card before it calls this. For the vanilla
+  // "nothing local changed" case, remote wins wholesale.
   if (!existing.localDirty) {
     merged.title = remote.title;
     merged.details = remote.details;
@@ -101,7 +105,32 @@ function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId }) {
     merged.dueDate = remote.dueDate;
     merged.startDate = remote.startDate;
   }
+  // Baseline always tracks the *remote* view so the next push has an accurate
+  // starting point for 3-way diffs.
+  merged.baseline = remote.baseline;
   return merged;
+}
+
+/**
+ * Build the JSON payload for `PUT /boards/{bid}/stacks/{sid}/cards/{cid}`.
+ * Deck requires `title`, `type`, and `owner`; we omit fields we don't manage
+ * (checklist etc.) so the server's canonical shape wins for them.
+ */
+function localCardToDeckPatch(card, { owner } = {}) {
+  const payload = {
+    title: card.title || "Untitled card",
+    type: "plain",
+    description: card.details || "",
+    order: typeof card.position === "number" ? card.position : 0,
+    duedate: card.dueDate ? new Date(`${card.dueDate}T00:00:00Z`).toISOString() : null,
+  };
+  if (owner) payload.owner = owner;
+  return payload;
+}
+
+/** Body for the initial `POST /cards` call. Same shape as the update payload. */
+function localCardToDeckCreate(card, opts) {
+  return localCardToDeckPatch(card, opts);
 }
 
 /**
@@ -185,6 +214,8 @@ module.exports = {
   decodeDeckDate,
   remoteCardToLocal,
   mergeRemoteCardOntoLocal,
+  localCardToDeckPatch,
+  localCardToDeckCreate,
   remoteBoardToLocal,
   reconcileBoardStructure,
   isRemoteTracked,

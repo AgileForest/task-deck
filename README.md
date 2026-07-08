@@ -1,25 +1,16 @@
-# Task Deck
+# Obsidian Nextcloud Deck
 
 [![Obsidian](https://img.shields.io/badge/Obsidian-1.5%2B-7c3aed?logo=obsidian&logoColor=white)](https://obsidian.md)
-[![Release](https://img.shields.io/github/v/release/ismailivanov/task-deck?label=release)](https://github.com/ismailivanov/task-deck/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-f1c40f.svg)](LICENSE)
-[![Sync Deck](https://img.shields.io/badge/cloud%20sync-Sync%20Deck-7c3aed.svg)](https://github.com/ismailivanov/sync-deck)
-[![Support](https://img.shields.io/badge/support-Buy%20Me%20a%20Coffee-ffdd00.svg)](https://buymeacoffee.com/carbon06)
 
-Task Deck is a small kanban board for Obsidian. It keeps the board simple, but every card is still a real Markdown note in your vault.
+Obsidian Nextcloud Deck is a Kanban board plugin for Obsidian, with every card stored as a real Markdown note in your vault. Optional Nextcloud Deck sync (in development) keeps your boards consistent across Obsidian desktop, Obsidian mobile, Nextcloud Web, and the official Nextcloud Deck apps.
 
-I built it for tracking tasks without leaving Obsidian: lists, cards, labels, dates, and checklists in one view. Want it on all your devices, or shared with a team? Pair it with [**Sync Deck**](https://github.com/ismailivanov/sync-deck) for cloud sync and live presence.
-
-<img width="1512" height="982" alt="image" src="https://github.com/user-attachments/assets/6bfa709d-2cf8-4900-a274-9e95927541b4" />
-
-<img width="1512" height="982" alt="image" src="https://github.com/user-attachments/assets/bf7a2472-60bd-4ce4-81da-d30f92c2bc57" />
-
-<img width="1512" height="982" alt="image" src="https://github.com/user-attachments/assets/90bdd068-7040-4367-bfa0-58ef921b24bc" />
+Forked from [Task Deck](https://github.com/ismailivanov/task-deck) and refocused on Nextcloud as the sync backend, so you keep full ownership of your data on your own server.
 
 ## Features
 
 - Kanban lists with drag-and-drop ordering
-- As many boards as you want (unlimited on its own)
+- Unlimited boards
 - Each board stores cards as Markdown notes in its own board folder
 - Inline card creation and renaming
 - Global colored labels
@@ -27,7 +18,7 @@ I built it for tracking tasks without leaving Obsidian: lists, cards, labels, da
 - Checklist progress on cards
 - Card details rendered as Markdown
 - Picks up Markdown cards you create outside the board
-- Syncs across your devices and team with [Sync Deck](https://github.com/ismailivanov/sync-deck)
+- **(coming)** Optional Nextcloud Deck sync via App Password / Login Flow v2
 
 ## Usage
 
@@ -40,23 +31,31 @@ I built it for tracking tasks without leaving Obsidian: lists, cards, labels, da
 - Use `Open note` when you want to work with the card as a normal Markdown file.
 - Drag cards between lists and drag list headers to reorder columns.
 
-If you create a Markdown card directly inside a board folder, Task Deck will pick it up and show it on that board.
+If you create a Markdown card directly inside a board folder, Obsidian Nextcloud Deck will pick it up and show it on that board.
 
-## Sync across devices and teams
+## Nextcloud sync (roadmap)
 
-Task Deck stores every board and card as plain Markdown in your vault, and [**Sync Deck**](https://github.com/ismailivanov/sync-deck) keeps them in sync — across your devices and with your team.
+Sync uses the [Nextcloud Deck REST API](https://deck.readthedocs.io/en/latest/API/). Authentication is via **Login Flow v2** (recommended) or a manually generated **App Password**. All API traffic goes through Obsidian's built-in `requestUrl`, so no browser CORS restrictions apply and no third-party proxy is needed.
 
-Install both plugins and sign in to Sync Deck. Your boards then sync everywhere, with **live presence** so you can see who's on which card in real time. There's a **Sync your boards & vaults** button in Task Deck's board view that opens Sync Deck. On the Free plan you can sync one board; Pro syncs unlimited — and Task Deck stays unlimited locally either way.
+Roadmap:
+
+1. **M1** — Sign in, encrypted credential storage, connection test.
+2. **M2** — Read-only pull of remote boards, stacks, and cards.
+3. **M3** — Two-way incremental sync with field-level conflict resolution.
+4. **M4** — Attachment sync using Deck's native `deck_file` / `file` attachments (no S3, entirely Nextcloud-hosted).
+5. **M5** — Mobile validation, diagnostics, and docs.
+
+Nextcloud Deck ≥ 1.9 and Nextcloud ≥ 25 are recommended.
 
 ## Install
 
 Download the release files and place them here:
 
 ```text
-Your Vault/.obsidian/plugins/task-deck/
+Your Vault/.obsidian/plugins/obsidian-nextcloud-deck/
 ```
 
-Then enable **Task Deck** from Obsidian's *Community plugins* settings.
+Then enable **Obsidian Nextcloud Deck** from Obsidian's *Community plugins* settings.
 
 ## Development
 
@@ -68,10 +67,11 @@ node build.js
 
 Obsidian loads the generated `main.js` file.
 
-## Support
+## Credits
 
-If Task Deck is useful for your workflow, you can support the project: [Buy me a coffee](https://buymeacoffee.com/carbon06).
+- Upstream Kanban implementation by [Ismail Ivanov (Task Deck)](https://github.com/ismailivanov/task-deck) — MIT licensed.
+- Nextcloud Deck backend by the Nextcloud community — [nextcloud/deck](https://github.com/nextcloud/deck).
 
 ## License
 
-[MIT](LICENSE) © Ismail Ivanov
+[MIT](LICENSE)

@@ -4,6 +4,7 @@ const { Notice, Plugin, addIcon } = require("obsidian");
 const {
   BOARD_INDEX_MARKER,
   DEFAULT_DATA,
+  DEFAULT_NEXTCLOUD,
   LEGACY_BOARD_INDEX_SUFFIX,
   LEGACY_CARD_FOLDER,
   LIST_COLORS,
@@ -32,6 +33,13 @@ const { BoardView } = require("./board-view");
 const { COMPLETION_SOUND_URL } = require("./completion-sound");
 const { TextPromptModal } = require("./modals");
 const { TaskDeckSettingTab } = require("./settings-tab");
+const {
+  decryptAppPassword,
+  encryptAppPassword,
+  revokeAppPassword,
+} = require("./nextcloud-auth");
+const { DeckClient } = require("./deck-client");
+const { SyncManager } = require("./sync-manager");
 
 /**
  * Main plugin controller.
@@ -45,11 +53,6 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     // In-memory load only (reads data.json + normalizes) so this.data exists for
     // the board view. Heavy vault I/O is deferred to onLayoutReady below.
     await this.loadPluginData();
-
-    // Live "someone else is editing this card" locks, keyed by card id. Filled
-    // from the SyncDeck presence roster; read by the board and the card modal.
-    this.cardLocks = new Map();
-    this.editingCardId = null;
 
     addIcon(TASK_DECK_ICON, TASK_DECK_ICON_SVG);
     this.registerView(VIEW_TYPE, (leaf) => new BoardView(leaf, this));
@@ -66,14 +69,21 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
         console.error("Task Deck: startup vault reconcile failed", error);
         new Notice("Task Deck loaded, but reconciling notes hit an error. Your boards are intact.");
       });
+      // Kick off Nextcloud pulls only after the vault has settled so any
+      // startup file work runs first (and any 30s local safety net doesn't
+      // fight a remote pull for the same data.json write lock).
+      this.scheduleNextcloudSync();
+      if (this.isNextcloudEnabled()) {
+        this.runNextcloudSync().catch(() => {});
+      }
     });
 
     // Boards sync themselves: vault events reconcile on change, and this periodic
-    // safety net re-imports every ~30s so remote edits (pulled by Sync Deck) show
-    // up even if an event is missed. Skipped while reconciling or editing a card,
-    // so it never disrupts the user. The manual "Sync" button still works too.
+    // safety net re-imports every ~30s so remote edits (pulled by Nextcloud Deck
+    // sync in a future phase) show up even if an event is missed. The manual
+    // "Sync" button still works too.
     this.registerInterval(window.setInterval(() => {
-      if (this.reconciling || this.editingCardId) return;
+      if (this.reconciling) return;
       const before = JSON.stringify(this.data.boards);
       Promise.resolve(this.syncCardsFromFolder())
         .then(() => { if (JSON.stringify(this.data.boards) !== before) this.refreshViews(); })
@@ -120,6 +130,11 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.data.labels = this.data.labels || [];
     this.data.completionSound = this.data.completionSound !== false;
     this.data.compactLabels = !!this.data.compactLabels;
+    // Merge saved Nextcloud config on top of the default so a schema addition
+    // never leaves a required field undefined. Keys not in DEFAULT_NEXTCLOUD are
+    // dropped to avoid stale flags from older versions leaking through.
+    const savedNextcloud = (saved && saved.nextcloud) || {};
+    this.data.nextcloud = Object.assign({}, DEFAULT_NEXTCLOUD, savedNextcloud);
     this.data.labels = this.normalizeGlobalLabels(this.data.labels);
     this.data.boards = this.data.boards.map((board) => this.normalizeBoard(board));
     this.loadNeedsSave = this.ensureListColors();
@@ -129,9 +144,18 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       card.completed = !!card.completed;
       card.startDate = cleanDate(card.startDate);
       card.dueDate = cleanDate(card.dueDate);
+      // Sync metadata (populated by future Nextcloud sync). Kept nullable so an
+      // unbound board's cards stay lightweight in data.json.
+      if (card.remoteId === undefined) card.remoteId = null;
+      if (card.etag === undefined) card.etag = null;
+      if (card.remoteUpdatedAt === undefined) card.remoteUpdatedAt = 0;
+      if (card.baselineHash === undefined) card.baselineHash = null;
+      if (card.localDirty === undefined) card.localDirty = false;
     });
     this.data.boards.forEach((board) => {
       board.folderPath = board.folderPath || this.inferBoardFolder(board) || cardFileBaseName(board.name);
+      if (board.remoteId === undefined) board.remoteId = null;
+      if (board.etag === undefined) board.etag = null;
     });
     this.data.activeBoardId = this.findBoard(this.data.activeBoardId)
       ? this.data.activeBoardId
@@ -181,6 +205,139 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     await this.writeBoardIndexFiles();
     await this.syncGraphColorGroups();
     await this.saveData(this.data);
+  }
+
+  // Nextcloud helpers -------------------------------------------------------
+  //
+  // Credentials round-trip through data.json in encrypted form. The App
+  // Password is only ever held in this.nextcloudAppPassword (in memory) while
+  // the plugin is loaded; the DeckClient is lazy so unauthenticated users
+  // never pay the setup cost.
+
+  isNextcloudEnabled() {
+    const nc = this.data && this.data.nextcloud;
+    return !!(nc && nc.enabled && nc.serverUrl && nc.username && nc.appPasswordCipher);
+  }
+
+  /**
+   * Decrypt and cache the App Password. Returns "" when no credentials are
+   * saved. Throws when the ciphertext is corrupt / undecryptable — the
+   * settings tab uses that to surface a "please sign in again" state.
+   */
+  async loadNextcloudAppPassword() {
+    if (this.nextcloudAppPassword) return this.nextcloudAppPassword;
+    const nc = this.data && this.data.nextcloud;
+    if (!nc || !nc.appPasswordCipher) return "";
+    const plaintext = await decryptAppPassword(nc.appPasswordCipher);
+    this.nextcloudAppPassword = plaintext;
+    return plaintext;
+  }
+
+  /**
+   * Persist a fresh { serverUrl, username, appPassword } tuple. `enabled` is
+   * set to true because "we just successfully signed in" is the only path
+   * here — flip it off through signOutNextcloud() instead.
+   */
+  async saveNextcloudCredentials({ serverUrl, username, appPassword }) {
+    if (!serverUrl || !username || !appPassword) {
+      throw new Error("Missing server URL, username, or App Password.");
+    }
+    const cipher = await encryptAppPassword(appPassword);
+    this.data.nextcloud = Object.assign({}, this.data.nextcloud || {}, {
+      enabled: true,
+      serverUrl,
+      username,
+      appPasswordCipher: cipher,
+    });
+    this.nextcloudAppPassword = appPassword;
+    this.deckClient = null;
+    await this.saveData(this.data);
+    this.scheduleNextcloudSync();
+  }
+
+  /**
+   * Local + remote sign-out. Remote revocation is best-effort: even if
+   * Nextcloud is unreachable we still clear local state so the user can
+   * always get out of a bad login.
+   */
+  async signOutNextcloud() {
+    const nc = this.data && this.data.nextcloud;
+    if (nc && nc.serverUrl && nc.username && this.nextcloudAppPassword) {
+      await revokeAppPassword(nc.serverUrl, nc.username, this.nextcloudAppPassword).catch(() => false);
+    }
+    this.data.nextcloud = Object.assign({}, this.data.nextcloud || {}, {
+      enabled: false,
+      serverUrl: "",
+      username: "",
+      appPasswordCipher: "",
+      boardBindings: {},
+      lastSyncAt: 0,
+    });
+    this.nextcloudAppPassword = "";
+    this.deckClient = null;
+    if (this.nextcloudPullTimer) { window.clearInterval(this.nextcloudPullTimer); this.nextcloudPullTimer = null; }
+    await this.saveData(this.data);
+  }
+
+  /**
+   * Lazy DeckClient. Returns null when the user isn't signed in yet, or when
+   * the stored ciphertext can't be decrypted (which surfaces as a "sign in
+   * again" state in the settings tab).
+   */
+  async getDeckClient() {
+    if (!this.isNextcloudEnabled()) return null;
+    if (this.deckClient) return this.deckClient;
+    let appPassword = "";
+    try {
+      appPassword = await this.loadNextcloudAppPassword();
+    } catch (error) {
+      console.error("Obsidian Nextcloud Deck: could not decrypt saved App Password", error);
+      return null;
+    }
+    if (!appPassword) return null;
+    const nc = this.data.nextcloud;
+    this.deckClient = new DeckClient({
+      serverUrl: nc.serverUrl,
+      username: nc.username,
+      appPassword,
+      logger: (event) => this.pushSyncLog(event),
+    });
+    return this.deckClient;
+  }
+
+  pushSyncLog(event) {
+    if (!this.syncLog) this.syncLog = [];
+    this.syncLog.push(Object.assign({ at: Date.now() }, event));
+    // Cap the buffer so a chatty sync never balloons memory.
+    if (this.syncLog.length > 200) this.syncLog.splice(0, this.syncLog.length - 200);
+  }
+
+  /**
+   * Lazy SyncManager. Created on first access so plain local use never spins
+   * up the machinery. Reset by signOutNextcloud() alongside `deckClient`.
+   */
+  getSyncManager() {
+    if (!this.syncManager) this.syncManager = new SyncManager(this);
+    return this.syncManager;
+  }
+
+  /** Run a pull from Nextcloud Deck. Safe to call when disconnected — the
+   *  manager will surface a status message instead of throwing. */
+  async runNextcloudSync({ manual = false } = {}) {
+    if (!this.isNextcloudEnabled()) return { state: "idle", at: Date.now(), message: "Not connected." };
+    const manager = this.getSyncManager();
+    return manager.runPull({ manual });
+  }
+
+  scheduleNextcloudSync() {
+    if (this.nextcloudPullTimer) window.clearInterval(this.nextcloudPullTimer);
+    const interval = Number((this.data.nextcloud || {}).syncIntervalMs || 0);
+    if (!interval) return; // manual only
+    this.nextcloudPullTimer = window.setInterval(() => {
+      if (!this.isNextcloudEnabled()) return;
+      this.runNextcloudSync().catch((error) => console.error("Nextcloud pull failed", error));
+    }, interval);
+    this.registerInterval(this.nextcloudPullTimer);
   }
 
   getBoard() {
@@ -418,83 +575,10 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     });
   }
 
-  getSyncDeckPlugin() {
-    const plugins = this.app.plugins && this.app.plugins.plugins;
-    return (plugins && plugins["sync-deck"]) || null;
-  }
-
-  // Open the Sync Deck panel (cloud sync for boards + vaults). If Sync Deck isn't
-  // installed, point the user at it.
-  async openSyncDeck() {
-    const syncDeck = this.getSyncDeckPlugin();
-    if (!syncDeck || typeof syncDeck.activateView !== "function") {
-      new Notice("Install the Sync Deck plugin to sync your boards and vaults across devices.");
-      window.open("https://github.com/ismailivanov/SyncDeck");
-      return;
-    }
-    try {
-      await syncDeck.activateView();
-    } catch (error) {
-      new Notice("Could not open Sync Deck.");
-    }
-  }
-
-  // Free Sync Deck accounts can only sync a limited number of boards. The gate
-  // applies ONLY when Sync Deck is installed AND signed in AND on the free plan,
-  // so a standalone Task Deck (no cloud account) stays unlimited. Pro or an
-  // unset/null limit => unlimited. Existing boards are never removed; only NEW
-  // board creation past the limit is blocked.
-  boardGate() {
-    const syncDeck = this.getSyncDeckPlugin();
-    const sd = syncDeck && syncDeck.data;
-    // The board limit only applies to SYNCED boards: it bites only when the user
-    // is signed in AND actively syncing on the free plan. Not syncing (sync off
-    // or no Sync Deck account) => unlimited local boards.
-    if (!sd || !sd.signedIn || !sd.syncEnabled) return { limited: false, limit: null };
-    const limit = sd.boardLimit;
-    if (sd.plan === "pro" || limit === null || limit === undefined || !Number.isFinite(Number(limit))) {
-      return { limited: false, limit: null };
-    }
-    return { limited: true, limit: Number(limit) };
-  }
-
-  // True (and warns) when the free board limit is already reached.
-  boardLimitReached(notify) {
-    const gate = this.boardGate();
-    if (!gate.limited || this.data.boards.length < gate.limit) return false;
-    if (notify) {
-      new Notice(`While syncing, the free plan covers ${gate.limit} board${gate.limit === 1 ? "" : "s"}. Upgrade Sync Deck to Pro to sync more.`);
-    }
-    return true;
-  }
-
-  getSyncDeckBridge() {
-    const syncDeck = this.getSyncDeckPlugin();
-    const data = syncDeck && syncDeck.data;
-    if (!syncDeck || typeof syncDeck.api !== "function") return null;
-    if (!data || !data.signedIn || !data.authToken || !data.vaultId) return null;
-    return syncDeck;
-  }
-
-  // Assignable users = the SyncDeck vault members. Empty when SyncDeck is not
-  // installed/signed in (the assignee UI then just shows nothing to assign).
-  getVaultMembers() {
-    const syncDeck = this.getSyncDeckPlugin();
-    const members = syncDeck && syncDeck.data && syncDeck.data.members;
-    if (!Array.isArray(members)) return [];
-    return members
-      .filter((m) => m && m.email)
-      .map((m) => ({ email: m.email, name: m.name || m.email, color: m.color || "#8b5cf6", picture: m.picture || "" }));
-  }
-
-  // The avatar picture for an assignee, resolved live from SyncDeck (not stored
-  // in the card frontmatter, since the URL can change/expire).
-  getMemberPicture(email) {
-    const member = this.getVaultMembers().find((m) => m.email === email);
-    return (member && member.picture) || "";
-  }
-
   normalizeAssignees(assignees) {
+    // Assignee UI is disabled in MVP (single-user Nextcloud sync). We keep the
+    // data structure intact so existing card frontmatter round-trips cleanly and
+    // future team-mode can re-surface assignees without a migration.
     const seen = new Set();
     return (Array.isArray(assignees) ? assignees : [])
       .filter((a) => a && a.email)
@@ -524,92 +608,6 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     }
     if (!file || !isImagePath(file.path || file.name)) return null;
     return { src: this.app.vault.getResourcePath(file), name: file.name, file };
-  }
-
-  // Presence responses carry both the cursor roster (users) and the card-lock
-  // roster (locks). Both helpers return { users, locks } on success, an empty
-  // object-shaped roster when the bridge is unavailable (a real "nobody here"),
-  // or null on a transient error so callers keep their last known state.
-  async sendBoardPresence(board, point) {
-    const syncDeck = this.getSyncDeckBridge();
-    if (!syncDeck || !board || !point) return { users: [], locks: [] };
-
-    try {
-      const result = await syncDeck.api(`/vaults/${encodeURIComponent(syncDeck.data.vaultId)}/taskdeck/presence`, {
-        method: "POST",
-        body: {
-          boardId: board.id,
-          boardName: board.name,
-          x: point.x,
-          y: point.y,
-          color: syncDeck.data.user.color || "#8b5cf6",
-        },
-      });
-      return { users: result.users || [], locks: result.locks || [] };
-    } catch (error) {
-      return null;
-    }
-  }
-
-  async fetchBoardPresence(boardId) {
-    const syncDeck = this.getSyncDeckBridge();
-    if (!syncDeck || !boardId) return { users: [], locks: [] };
-
-    try {
-      const result = await syncDeck.api(`/vaults/${encodeURIComponent(syncDeck.data.vaultId)}/taskdeck/presence?boardId=${encodeURIComponent(boardId)}`);
-      return { users: result.users || [], locks: result.locks || [] };
-    } catch (error) {
-      return null;
-    }
-  }
-
-  // Card edit locks ---------------------------------------------------------
-
-  async postCardLock(boardId, cardId, action) {
-    const syncDeck = this.getSyncDeckBridge();
-    if (!syncDeck || !boardId || !cardId) return null;
-    try {
-      return await syncDeck.api(`/vaults/${encodeURIComponent(syncDeck.data.vaultId)}/taskdeck/lock`, {
-        method: "POST",
-        body: {
-          boardId,
-          cardId,
-          action,
-          color: syncDeck.data.user.color || "#8b5cf6",
-        },
-      });
-    } catch (error) {
-      return null;
-    }
-  }
-
-  // Try to take the lock for a card. Returns { ok, lock } — ok:false means
-  // someone else holds it (lock describes the holder). null means offline: we
-  // fail open so a server hiccup never blocks local editing.
-  async acquireCardLock(boardId, cardId) {
-    const result = await this.postCardLock(boardId, cardId, "acquire");
-    if (!result) return { ok: true, offline: true };
-    if (Array.isArray(result.locks)) this.setCardLocks(result.locks);
-    return result;
-  }
-
-  async releaseCardLock(boardId, cardId) {
-    const result = await this.postCardLock(boardId, cardId, "release");
-    if (result && Array.isArray(result.locks)) this.setCardLocks(result.locks);
-    return result;
-  }
-
-  setCardLocks(locks) {
-    const next = new Map();
-    (locks || []).forEach((lock) => {
-      if (lock && lock.cardId) next.set(lock.cardId, lock);
-    });
-    this.cardLocks = next;
-  }
-
-  // The holder if this card is being edited by someone else, otherwise null.
-  getCardLockHolder(cardId) {
-    return (this.cardLocks && this.cardLocks.get(cardId)) || null;
   }
 
   updateExplorerColors() {
@@ -970,15 +968,12 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
   }
 
   createBoardPrompt() {
-    if (this.boardLimitReached(true)) return;
     this.promptText("Create board", "Board name", "", async (name) => {
       await this.createBoard(name);
     });
   }
 
   async createBoard(name) {
-    // Safety net: never exceed the free board limit even via a non-prompt caller.
-    if (this.boardLimitReached(true)) return null;
     const board = {
       id: uid("board"),
       name,
@@ -1367,10 +1362,10 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
 
   /**
    * Two card files sharing one kanban-card-id are the SAME card — e.g. a move
-   * that Sync Deck (a generic file syncer with no rename concept) split into a
-   * create+delete across devices, leaving a duplicate. Keep one canonical file
-   * and send the rest to the recoverable trash. The winner is chosen
-   * deterministically (device-independent) so peers converge instead of fight.
+   * that a naïve file syncer (no rename concept) split into a create+delete
+   * across devices, leaving a duplicate. Keep one canonical file and send the
+   * rest to the recoverable trash. The winner is chosen deterministically
+   * (device-independent) so peers converge instead of fight.
    */
   async dedupeCardFilesById() {
     const byId = new Map();

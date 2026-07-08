@@ -1,4 +1,4 @@
-const { MarkdownRenderer, Menu, Modal, Notice, setIcon } = require("obsidian");
+const { MarkdownRenderer, Modal, Notice, setIcon } = require("obsidian");
 
 // Modal UIs for cards, labels, dates, prompts, and the short about panel.
 const {
@@ -23,7 +23,6 @@ const {
   stripImageEmbeds,
   textButton,
   textLine,
-  initials,
 } = require("./helpers");
 
 // Pull image files out of a paste/drop DataTransfer (empty if none).
@@ -676,11 +675,9 @@ class CardModal extends Modal {
     this.addingChecklistItem = false;
     this.saveTimer = null;
     this.savePromise = Promise.resolve();
+    // readOnly kept as a permanent false so old branches still short-circuit
+    // cleanly; card locking was removed with the Sync Deck integration.
     this.readOnly = false;
-    this.lockHolder = null;
-    this.lockAcquired = false;
-    this.lockBoardId = null;
-    this.lockHeartbeat = null;
   }
 
   onOpen() {
@@ -714,73 +711,7 @@ class CardModal extends Modal {
     this.editingDetails = false;
     this.localChecklist = clone(card.checklist || []);
     this.localAssignees = clone(card.assignees || []);
-    await this.setupCardLock();
     this.render();
-  }
-
-  /**
-   * Decide whether this card can be edited. If someone else already holds the
-   * lock we open read-only; otherwise we take the lock and keep it warm with a
-   * heartbeat until the modal closes. Offline / no-SyncDeck falls open (editable).
-   */
-  async setupCardLock() {
-    const board = this.plugin.getBoard();
-    this.lockBoardId = board && board.id;
-
-    const holder = this.plugin.getCardLockHolder && this.plugin.getCardLockHolder(this.cardId);
-    if (holder) {
-      this.readOnly = true;
-      this.lockHolder = holder;
-      return;
-    }
-    if (!this.lockBoardId || !this.plugin.acquireCardLock) return;
-
-    const result = await this.plugin.acquireCardLock(this.lockBoardId, this.cardId);
-    if (result && result.ok === false) {
-      this.readOnly = true;
-      this.lockHolder = result.lock || null;
-      return;
-    }
-    this.lockAcquired = !!(result && result.ok && !result.offline);
-    this.plugin.editingCardId = this.cardId;
-    this.startLockHeartbeat();
-  }
-
-  startLockHeartbeat() {
-    this.stopLockHeartbeat();
-    // Re-take the lock well within its server TTL so it never lapses mid-edit.
-    // If the server now reports someone else holds it (we opened while offline,
-    // or another editor took over), drop this modal to read-only.
-    this.lockHeartbeat = window.setInterval(async () => {
-      if (!this.lockBoardId || this.readOnly) return;
-      const result = await this.plugin.acquireCardLock(this.lockBoardId, this.cardId).catch(() => null);
-      if (result && result.ok === false) this.enterReadOnly(result.lock);
-    }, 5000);
-  }
-
-  // Convert an open editable modal into a read-only view after losing the lock.
-  // Unsaved edits are dropped rather than saved, so we never persist a write that
-  // would conflict with the real editor's changes.
-  enterReadOnly(holder) {
-    if (this.readOnly) return;
-    this.readOnly = true;
-    this.lockHolder = holder || this.lockHolder;
-    this.lockAcquired = false;
-    if (this.saveTimer) {
-      window.clearTimeout(this.saveTimer);
-      this.saveTimer = null;
-    }
-    this.stopLockHeartbeat();
-    if (this.plugin.editingCardId === this.cardId) this.plugin.editingCardId = null;
-    new Notice(`🔒 ${(holder && holder.name) || "Someone"} is editing this card`);
-    this.render();
-  }
-
-  stopLockHeartbeat() {
-    if (this.lockHeartbeat) {
-      window.clearInterval(this.lockHeartbeat);
-      this.lockHeartbeat = null;
-    }
   }
 
   /**
@@ -804,100 +735,6 @@ class CardModal extends Modal {
     return this.localLabels.some((item) => labelKey(item) === key);
   }
 
-  renderAssigneesField() {
-    const field = createElement("div", "ot-field ot-assignee-editor");
-    field.append(createElement("span", "", "Members"));
-    const row = createElement("div", "ot-assignee-row");
-
-    const rebuild = () => {
-      row.replaceChildren();
-      (this.localAssignees || []).forEach((assignee) => {
-        const chip = createElement("span", "ot-assignee-chip");
-        const avatar = createElement("span", "ot-card-avatar");
-        avatar.style.setProperty("--ot-avatar-color", assignee.color || "#8b5cf6");
-        const picture = this.plugin.getMemberPicture(assignee.email);
-        if (picture) {
-          const img = createElement("img", "");
-          img.src = picture;
-          img.alt = "";
-          avatar.append(img);
-        } else {
-          avatar.textContent = initials(assignee.name || assignee.email);
-          avatar.classList.add("is-initials");
-        }
-        const remove = iconButton("x", "Remove member", () => {
-          this.localAssignees = (this.localAssignees || []).filter((a) => a.email !== assignee.email);
-          rebuild();
-          this.queueSave();
-        });
-        remove.classList.add("ot-assignee-remove");
-        chip.append(avatar, createElement("span", "ot-assignee-name", assignee.name || assignee.email), remove);
-        row.append(chip);
-      });
-      const addButton = iconButton("plus", "Assign a member", (event) => this.showMemberMenu(event, rebuild));
-      addButton.classList.add("ot-assignee-add");
-      row.append(addButton);
-    };
-
-    rebuild();
-    field.append(row);
-    return field;
-  }
-
-  showMemberMenu(event, rebuild) {
-    const members = this.plugin.getVaultMembers();
-    const menu = new Menu();
-    if (!members.length) {
-      menu.addItem((item) => item.setTitle("No members — sign in to Sync Deck").setDisabled(true));
-    } else {
-      members.forEach((member) => {
-        const assigned = (this.localAssignees || []).some((a) => a.email === member.email);
-        menu.addItem((item) => {
-          item.setTitle(member.name || member.email).setChecked(assigned).onClick(() => {
-            if (assigned) {
-              this.localAssignees = (this.localAssignees || []).filter((a) => a.email !== member.email);
-            } else {
-              this.localAssignees = [...(this.localAssignees || []), { email: member.email, name: member.name, color: member.color }];
-            }
-            rebuild();
-            this.queueSave();
-          });
-        });
-      });
-    }
-    menu.showAtMouseEvent(event);
-  }
-
-  // Single-member picker for one checklist item (leftmost circle).
-  showChecklistMemberMenu(event, item, rerender) {
-    const members = this.plugin.getVaultMembers();
-    const menu = new Menu();
-    menu.addItem((mi) => mi
-      .setTitle("Unassigned")
-      .setChecked(!(item.assignee && item.assignee.email))
-      .onClick(() => {
-        item.assignee = null;
-        rerender();
-        this.saveNow().catch(console.error);
-      }));
-    if (!members.length) {
-      menu.addItem((mi) => mi.setTitle("No members — sign in to Sync Deck").setDisabled(true));
-    } else {
-      members.forEach((member) => {
-        const current = !!(item.assignee && item.assignee.email === member.email);
-        menu.addItem((mi) => mi
-          .setTitle(member.name || member.email)
-          .setChecked(current)
-          .onClick(() => {
-            item.assignee = { email: member.email, name: member.name, color: member.color };
-            rerender();
-            this.saveNow().catch(console.error);
-          }));
-      });
-    }
-    menu.showAtMouseEvent(event);
-  }
-
   render() {
     const card = this.card;
     this.contentEl.replaceChildren();
@@ -913,7 +750,6 @@ class CardModal extends Modal {
     });
 
     const labelsField = this.renderLabelsField();
-    const assigneesField = this.renderAssigneesField();
     const detailsField = this.renderDetailsField();
     const checklistField = this.renderChecklistField();
 
@@ -948,45 +784,14 @@ class CardModal extends Modal {
 
     actions.append(deleteButton, openNote, close);
 
-    const children = [title, labelsField, assigneesField, detailsField, checklistField, actions];
-    if (this.readOnly) {
-      this.contentEl.addClass("ot-card-readonly");
-      const holderName = (this.lockHolder && this.lockHolder.name) || "Someone";
-      children.unshift(createElement("div", "ot-card-lock-banner", `🔒 ${holderName} is editing this card — read only`));
-    }
-    this.contentEl.append(...children);
+    this.contentEl.append(title, labelsField, detailsField, checklistField, actions);
 
-    if (this.readOnly) {
-      title.disabled = true;
-      deleteButton.disabled = true;
-      this.disableEditing([labelsField, assigneesField, detailsField, checklistField]);
-    } else if (!this.editingDetails) {
+    if (!this.editingDetails) {
       requestAnimationFrame(() => title.focus());
     }
   }
 
-  // Freeze every editable control inside the given fields so a read-only viewer
-  // can look but not change anything (Open note / Close stay usable).
-  disableEditing(fields) {
-    fields.forEach((field) => {
-      field.querySelectorAll("input, textarea, button, [contenteditable]").forEach((el) => {
-        if (el.classList.contains("ot-image-tile")) return;
-        if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "BUTTON") {
-          el.disabled = true;
-        } else {
-          el.setAttribute("contenteditable", "false");
-        }
-        el.classList.add("is-disabled");
-      });
-    });
-  }
-
   onClose() {
-    this.stopLockHeartbeat();
-    if (!this.readOnly && this.lockBoardId && this.plugin.releaseCardLock) {
-      this.plugin.releaseCardLock(this.lockBoardId, this.cardId).catch(() => {});
-    }
-    if (this.plugin.editingCardId === this.cardId) this.plugin.editingCardId = null;
     if (this.saveTimer) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
@@ -1645,42 +1450,7 @@ class CardModal extends Modal {
           this.queueSave();
         });
 
-        // Per-item member circle (leftmost): click to assign this item to a member.
-        const assigneeBtn = createElement("button", "ot-checklist-assignee");
-        assigneeBtn.type = "button";
-        const paintAssignee = () => {
-          assigneeBtn.replaceChildren();
-          const a = item.assignee;
-          if (a && a.email) {
-            assigneeBtn.classList.add("is-assigned");
-            assigneeBtn.title = a.name || a.email;
-            const avatar = createElement("span", "ot-card-avatar");
-            avatar.style.setProperty("--ot-avatar-color", a.color || "#8b5cf6");
-            const picture = this.plugin.getMemberPicture(a.email);
-            if (picture) {
-              const img = createElement("img", "");
-              img.src = picture;
-              img.alt = "";
-              avatar.append(img);
-            } else {
-              avatar.textContent = initials(a.name || a.email);
-              avatar.classList.add("is-initials");
-            }
-            assigneeBtn.append(avatar);
-          } else {
-            assigneeBtn.classList.remove("is-assigned");
-            assigneeBtn.title = "Assign member";
-            assigneeBtn.append(createElement("span", "ot-checklist-assignee-empty"));
-          }
-        };
-        paintAssignee();
-        assigneeBtn.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          this.showChecklistMemberMenu(event, item, paintAssignee);
-        });
-
-        row.append(assigneeBtn, checkbox, input, remove);
+        row.append(checkbox, input, remove);
         list.append(row);
       });
       updateProgress();

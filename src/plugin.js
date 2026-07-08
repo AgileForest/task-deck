@@ -60,6 +60,12 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     ["create", "modify", "rename", "delete"].forEach((eventName) => {
       this.registerEvent(this.app.vault.on(eventName, (file) => this.queueCardFolderSync(file, eventName)));
     });
+    // Independently, watch for local attachment deletions/renames so the sync
+    // manager can enqueue a Deck-side delete on the next tick. These events
+    // are ignored when the deleted file isn't inside a tracked card's
+    // attachments/ directory.
+    this.registerEvent(this.app.vault.on("delete", (file) => this.handleAttachmentDelete(file)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.handleAttachmentRename(file, oldPath)));
 
     // Reconcile card notes AFTER the workspace + metadata cache are ready, and
     // never let it reject onload(): a startup file error used to crash onload and
@@ -154,6 +160,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       if (card.baselineHash !== undefined) delete card.baselineHash;
       if (card.baseline === undefined) card.baseline = null;
       if (card.localDirty === undefined) card.localDirty = false;
+      if (!Array.isArray(card.attachments)) card.attachments = [];
     });
     this.data.boards.forEach((board) => {
       board.folderPath = board.folderPath || this.inferBoardFolder(board) || cardFileBaseName(board.name);
@@ -347,6 +354,61 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       stackRemoteId: list.remoteId,
       at: Date.now(),
     });
+    // Any attachments tied to this card also need to be reaped.
+    (card.attachments || []).forEach((attachment) => this.enqueueAttachmentDeletion(card, attachment));
+  }
+
+  /**
+   * Record an attachment deletion. Called both from card deletion and from
+   * the vault event handler when the user removes a file directly.
+   */
+  enqueueAttachmentDeletion(card, attachment) {
+    if (!card || !attachment || attachment.remoteId == null) return;
+    const board = this.data.boards.find((b) => b.id === card.boardId);
+    if (!board || board.remoteId == null) return;
+    const list = board.lists.find((l) => l.id === card.listId);
+    if (!list || list.remoteId == null) return;
+    if (card.remoteId == null) return;
+    const nc = this.data.nextcloud;
+    if (!Array.isArray(nc.pendingAttachmentDeletions)) nc.pendingAttachmentDeletions = [];
+    if (nc.pendingAttachmentDeletions.some((entry) => entry.attachmentRemoteId === attachment.remoteId)) return;
+    nc.pendingAttachmentDeletions.push({
+      attachmentRemoteId: attachment.remoteId,
+      cardRemoteId: card.remoteId,
+      stackRemoteId: list.remoteId,
+      boardRemoteId: board.remoteId,
+      at: Date.now(),
+    });
+  }
+
+  /**
+   * Vault delete handler: identifies whether the removed file matches a
+   * tracked attachment and, if so, enqueues the remote deletion and drops the
+   * entry from the card.
+   */
+  handleAttachmentDelete(file) {
+    if (!file || !file.path) return;
+    for (const card of Object.values(this.data.cards || {})) {
+      if (!Array.isArray(card.attachments)) continue;
+      const idx = card.attachments.findIndex((entry) => entry && entry.filePath === file.path);
+      if (idx < 0) continue;
+      const [removed] = card.attachments.splice(idx, 1);
+      this.enqueueAttachmentDeletion(card, removed);
+      this.saveData(this.data).catch(() => {});
+      return;
+    }
+  }
+
+  handleAttachmentRename(file, oldPath) {
+    if (!file || !file.path || !oldPath) return;
+    for (const card of Object.values(this.data.cards || {})) {
+      if (!Array.isArray(card.attachments)) continue;
+      const entry = card.attachments.find((att) => att && att.filePath === oldPath);
+      if (!entry) continue;
+      entry.filePath = file.path;
+      this.saveData(this.data).catch(() => {});
+      return;
+    }
   }
 
   /**

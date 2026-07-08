@@ -185,12 +185,71 @@ class DeckClient {
     return this.request({ method: "GET", path: `/boards/${encodeURIComponent(boardId)}/acl` });
   }
 
-  // Attachments (used by Phase 4 — kept here so the client remains complete).
+  // Attachments -------------------------------------------------------------
+  //
+  // Deck attachments are stored on the Nextcloud instance itself (whatever
+  // storage backend the admin configured — local disk, S3, Swift, …). Clients
+  // never see that layer; we only talk to the Deck attachment API, which
+  // brokers reads and writes on the card's behalf. `type=deck_file` uses
+  // Deck's own appdata directory and is the safest default (works on every
+  // Deck ≥ 1.0). `type=file` (Deck ≥ 1.9) references arbitrary Nextcloud Files
+  // paths; not used here for MVP.
+
   getAttachments(boardId, stackId, cardId) {
     return this.request({
       method: "GET",
       path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachments`,
     });
+  }
+
+  /**
+   * Upload an attachment. `data` may be a Uint8Array or ArrayBuffer.
+   * `filename` and `mimeType` should describe the source file (extension +
+   * best-effort MIME). Server responds with the attachment metadata.
+   */
+  uploadAttachment(boardId, stackId, cardId, { data, filename, mimeType }) {
+    return this.multipartRequest({
+      method: "POST",
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment`,
+      formFields: { type: "deck_file" },
+      file: { field: "file", data, filename, mimeType: mimeType || "application/octet-stream" },
+    });
+  }
+
+  deleteAttachment(boardId, stackId, cardId, attachmentId) {
+    return this.request({
+      method: "DELETE",
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`,
+    });
+  }
+
+  /**
+   * Download the raw bytes of an attachment. The Deck download endpoint sits
+   * outside the /api/v1.0 prefix (it streams the file through PHP directly),
+   * so we build the URL manually rather than through `buildUrl`.
+   */
+  async downloadAttachment(boardId, stackId, cardId, attachmentId) {
+    const url = `${this.serverUrl}/index.php/apps/deck/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`;
+    const headers = this.buildHeaders();
+    headers.Accept = "*/*";
+    delete headers["Content-Type"];
+
+    const response = await requestUrl({
+      url,
+      method: "GET",
+      headers,
+      throw: false,
+    });
+    const status = response.status || 0;
+    if (status < 200 || status >= 300) {
+      throw new DeckApiError(`Deck attachment download failed (${status}).`, { status, url, body: parseBody(response) });
+    }
+    return {
+      status,
+      data: response.arrayBuffer || null,
+      contentType: pickHeader(response, "content-type") || "application/octet-stream",
+      headers: response.headers || {},
+    };
   }
 
   // Low-level plumbing ------------------------------------------------------
@@ -308,6 +367,96 @@ class DeckClient {
       try { this.logger(event); } catch (error) { /* ignore logger faults */ }
     }
   }
+
+  /**
+   * Send a multipart/form-data POST. Used only by the attachment upload; the
+   * regular request() path stays JSON-only so its retry logic doesn't have to
+   * re-serialise binary bodies.
+   *
+   * We hand-roll the multipart body because Obsidian's requestUrl doesn't
+   * accept a FormData object directly — it wants an ArrayBuffer. This means
+   * we must construct the CRLF-delimited envelope ourselves.
+   */
+  async multipartRequest({ method, path, formFields = {}, file }) {
+    const url = this.buildUrl(path);
+    const boundary = `----ObsidianNextcloudDeck${Math.random().toString(36).slice(2)}`;
+    const encoder = new TextEncoder();
+    const chunks = [];
+
+    for (const [name, value] of Object.entries(formFields)) {
+      chunks.push(encoder.encode(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="${name}"\r\n\r\n` +
+        `${value}\r\n`,
+      ));
+    }
+
+    if (file) {
+      const safeName = String(file.filename || "file").replace(/"/g, "");
+      chunks.push(encoder.encode(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="${file.field || "file"}"; filename="${safeName}"\r\n` +
+        `Content-Type: ${file.mimeType || "application/octet-stream"}\r\n\r\n`,
+      ));
+      const bytes = file.data instanceof Uint8Array
+        ? file.data
+        : file.data instanceof ArrayBuffer
+          ? new Uint8Array(file.data)
+          : new Uint8Array(file.data || []);
+      chunks.push(bytes);
+      chunks.push(encoder.encode("\r\n"));
+    }
+
+    chunks.push(encoder.encode(`--${boundary}--\r\n`));
+
+    const body = concatUint8Arrays(chunks);
+    const headers = this.buildHeaders();
+    delete headers["Content-Type"]; // let contentType option set it
+    delete headers.Accept;
+    headers.Accept = "application/json";
+
+    let attempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      let response;
+      let transportError = null;
+      try {
+        response = await requestUrl({
+          url,
+          method,
+          headers,
+          body: body.buffer,
+          contentType: `multipart/form-data; boundary=${boundary}`,
+          throw: false,
+        });
+      } catch (error) {
+        transportError = error;
+        response = { status: 0 };
+      }
+
+      const status = response.status || 0;
+      this.log({ url, method, status, attempt, multipart: true });
+
+      if (status >= 200 && status < 300) {
+        return { status, data: parseBody(response), headers: response.headers || {} };
+      }
+      if (status && !RETRYABLE_STATUS.has(status)) {
+        throw new DeckApiError(`Deck attachment upload failed (${status}).`, {
+          status,
+          url,
+          body: parseBody(response),
+        });
+      }
+      attempt += 1;
+      if (attempt > this.maxRetries) {
+        if (transportError) {
+          throw new DeckApiError(`Deck attachment upload unreachable: ${transportError.message || transportError}.`, { status: 0, url });
+        }
+        throw new DeckApiError(`Deck attachment upload kept failing (${status}).`, { status, url, body: parseBody(response) });
+      }
+      await sleep(Math.min(MAX_BACKOFF_MS, 1000 * (2 ** (attempt - 1))));
+    }
+  }
 }
 
 function pickHeader(response, name) {
@@ -337,6 +486,18 @@ function parseBody(response) {
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function concatUint8Arrays(chunks) {
+  let total = 0;
+  for (const chunk of chunks) total += chunk.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 module.exports = {

@@ -9,6 +9,7 @@ const {
 const { DeckApiError } = require("./deck-client");
 const { detectFieldConflicts, applyPolicy, snapshotBaseline } = require("./conflict");
 const { ConflictModal } = require("./conflict-modal");
+const { AttachmentSyncer } = require("./attachment-sync");
 
 // Coordinates two-way sync with Nextcloud Deck.
 //
@@ -33,6 +34,7 @@ class SyncManager {
     this.plugin = plugin;
     this.status = { state: STATUS_IDLE, at: 0, message: "" };
     this.running = null;
+    this.attachments = new AttachmentSyncer(plugin);
   }
 
   getStatus() { return this.status; }
@@ -87,6 +89,7 @@ class SyncManager {
 
       // ---- Phase 3: Reap deletions ----------------------------------------
       const reaped = await this.reapDeletions(client);
+      const attachmentsReaped = await this.attachments.reap(client);
 
       this.plugin.data.nextcloud.lastSyncAt = Date.now();
       await this.plugin.savePluginData();
@@ -95,6 +98,7 @@ class SyncManager {
       const parts = [`Pulled ${remoteBoards.length} board${remoteBoards.length === 1 ? "" : "s"}`];
       if (pushed) parts.push(`pushed ${pushed} card${pushed === 1 ? "" : "s"}`);
       if (reaped) parts.push(`deleted ${reaped} remote card${reaped === 1 ? "" : "s"}`);
+      if (attachmentsReaped) parts.push(`removed ${attachmentsReaped} attachment${attachmentsReaped === 1 ? "" : "s"}`);
       if (conflicts) parts.push(`${conflicts} conflict${conflicts === 1 ? "" : "s"} skipped`);
 
       this.status = { state: STATUS_OK, at: Date.now(), message: `${parts.join(", ")}.` };
@@ -161,6 +165,13 @@ class SyncManager {
         this.plugin.data.cards[cardId] = merged;
         localList.cardIds.push(cardId);
         cardMap.delete(remoteCard.id);
+
+        // Fetch attachments for the card (only if feature-enabled).
+        try {
+          await this.attachments.pullCard(client, merged, localBoard, localList);
+        } catch (error) {
+          this.plugin.pushSyncLog({ event: "attachment-pull-failed", cardId, message: (error && error.message) || String(error) });
+        }
       }
     }
 
@@ -236,6 +247,9 @@ class SyncManager {
     if (!created) throw new Error("Empty response from createCard");
     this.applyRemoteToCard(card, created, localBoard.id, list.id);
     card.localDirty = false;
+    await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
+      this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
+    });
   }
 
   async pushUpdate(client, localBoard, list, card, remoteSnapshot, policy) {
@@ -281,6 +295,9 @@ class SyncManager {
     if (!updated) throw new Error("Empty response from updateCard");
     this.applyRemoteToCard(card, updated, localBoard.id, list.id);
     card.localDirty = false;
+    await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
+      this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
+    });
     return "pushed";
   }
 

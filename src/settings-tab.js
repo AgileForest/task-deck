@@ -308,6 +308,20 @@ class TaskDeckSettingTab extends PluginSettingTab {
           await this.plugin.saveData(this.plugin.data);
         });
       });
+
+    new Setting(containerEl)
+      .setName("Sync attachments (experimental)")
+      .setDesc("Download Deck card attachments into the board folder and upload files you drop into attachments/<cardId>/. Larger files may be slow on mobile.")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(!!nextcloud.attachmentsEnabled)
+          .onChange(async (value) => {
+            this.plugin.data.nextcloud = Object.assign({}, this.plugin.data.nextcloud, {
+              attachmentsEnabled: value,
+            });
+            await this.plugin.saveData(this.plugin.data);
+          });
+      });
   }
 
   formatSyncStatus(nextcloud, override) {

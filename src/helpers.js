@@ -62,6 +62,9 @@ const DEFAULT_NEXTCLOUD = {
   // Cards deleted locally that still need their remote counterpart torn down
   // on the next push. Shape: [{ remoteId, boardRemoteId, stackRemoteId, at }].
   pendingDeletions: [],
+  // Attachments deleted locally that still need to be removed from Nextcloud.
+  // Shape: [{ attachmentRemoteId, cardRemoteId, stackRemoteId, boardRemoteId, at }].
+  pendingAttachmentDeletions: [],
 };
 
 const DEFAULT_DATA = {

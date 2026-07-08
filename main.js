@@ -65,6 +65,9 @@ const DEFAULT_NEXTCLOUD = {
   // Cards deleted locally that still need their remote counterpart torn down
   // on the next push. Shape: [{ remoteId, boardRemoteId, stackRemoteId, at }].
   pendingDeletions: [],
+  // Attachments deleted locally that still need to be removed from Nextcloud.
+  // Shape: [{ attachmentRemoteId, cardRemoteId, stackRemoteId, boardRemoteId, at }].
+  pendingAttachmentDeletions: [],
 };
 
 const DEFAULT_DATA = {
@@ -3397,6 +3400,20 @@ class TaskDeckSettingTab extends PluginSettingTab {
           await this.plugin.saveData(this.plugin.data);
         });
       });
+
+    new Setting(containerEl)
+      .setName("Sync attachments (experimental)")
+      .setDesc("Download Deck card attachments into the board folder and upload files you drop into attachments/<cardId>/. Larger files may be slow on mobile.")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(!!nextcloud.attachmentsEnabled)
+          .onChange(async (value) => {
+            this.plugin.data.nextcloud = Object.assign({}, this.plugin.data.nextcloud, {
+              attachmentsEnabled: value,
+            });
+            await this.plugin.saveData(this.plugin.data);
+          });
+      });
   }
 
   formatSyncStatus(nextcloud, override) {
@@ -3668,12 +3685,71 @@ class DeckClient {
     return this.request({ method: "GET", path: `/boards/${encodeURIComponent(boardId)}/acl` });
   }
 
-  // Attachments (used by Phase 4 — kept here so the client remains complete).
+  // Attachments -------------------------------------------------------------
+  //
+  // Deck attachments are stored on the Nextcloud instance itself (whatever
+  // storage backend the admin configured — local disk, S3, Swift, …). Clients
+  // never see that layer; we only talk to the Deck attachment API, which
+  // brokers reads and writes on the card's behalf. `type=deck_file` uses
+  // Deck's own appdata directory and is the safest default (works on every
+  // Deck ≥ 1.0). `type=file` (Deck ≥ 1.9) references arbitrary Nextcloud Files
+  // paths; not used here for MVP.
+
   getAttachments(boardId, stackId, cardId) {
     return this.request({
       method: "GET",
       path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachments`,
     });
+  }
+
+  /**
+   * Upload an attachment. `data` may be a Uint8Array or ArrayBuffer.
+   * `filename` and `mimeType` should describe the source file (extension +
+   * best-effort MIME). Server responds with the attachment metadata.
+   */
+  uploadAttachment(boardId, stackId, cardId, { data, filename, mimeType }) {
+    return this.multipartRequest({
+      method: "POST",
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment`,
+      formFields: { type: "deck_file" },
+      file: { field: "file", data, filename, mimeType: mimeType || "application/octet-stream" },
+    });
+  }
+
+  deleteAttachment(boardId, stackId, cardId, attachmentId) {
+    return this.request({
+      method: "DELETE",
+      path: `/boards/${encodeURIComponent(boardId)}/stacks/${encodeURIComponent(stackId)}/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`,
+    });
+  }
+
+  /**
+   * Download the raw bytes of an attachment. The Deck download endpoint sits
+   * outside the /api/v1.0 prefix (it streams the file through PHP directly),
+   * so we build the URL manually rather than through `buildUrl`.
+   */
+  async downloadAttachment(boardId, stackId, cardId, attachmentId) {
+    const url = `${this.serverUrl}/index.php/apps/deck/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`;
+    const headers = this.buildHeaders();
+    headers.Accept = "*/*";
+    delete headers["Content-Type"];
+
+    const response = await requestUrl({
+      url,
+      method: "GET",
+      headers,
+      throw: false,
+    });
+    const status = response.status || 0;
+    if (status < 200 || status >= 300) {
+      throw new DeckApiError(`Deck attachment download failed (${status}).`, { status, url, body: parseBody(response) });
+    }
+    return {
+      status,
+      data: response.arrayBuffer || null,
+      contentType: pickHeader(response, "content-type") || "application/octet-stream",
+      headers: response.headers || {},
+    };
   }
 
   // Low-level plumbing ------------------------------------------------------
@@ -3791,6 +3867,96 @@ class DeckClient {
       try { this.logger(event); } catch (error) { /* ignore logger faults */ }
     }
   }
+
+  /**
+   * Send a multipart/form-data POST. Used only by the attachment upload; the
+   * regular request() path stays JSON-only so its retry logic doesn't have to
+   * re-serialise binary bodies.
+   *
+   * We hand-roll the multipart body because Obsidian's requestUrl doesn't
+   * accept a FormData object directly — it wants an ArrayBuffer. This means
+   * we must construct the CRLF-delimited envelope ourselves.
+   */
+  async multipartRequest({ method, path, formFields = {}, file }) {
+    const url = this.buildUrl(path);
+    const boundary = `----ObsidianNextcloudDeck${Math.random().toString(36).slice(2)}`;
+    const encoder = new TextEncoder();
+    const chunks = [];
+
+    for (const [name, value] of Object.entries(formFields)) {
+      chunks.push(encoder.encode(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="${name}"\r\n\r\n` +
+        `${value}\r\n`,
+      ));
+    }
+
+    if (file) {
+      const safeName = String(file.filename || "file").replace(/"/g, "");
+      chunks.push(encoder.encode(
+        `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="${file.field || "file"}"; filename="${safeName}"\r\n` +
+        `Content-Type: ${file.mimeType || "application/octet-stream"}\r\n\r\n`,
+      ));
+      const bytes = file.data instanceof Uint8Array
+        ? file.data
+        : file.data instanceof ArrayBuffer
+          ? new Uint8Array(file.data)
+          : new Uint8Array(file.data || []);
+      chunks.push(bytes);
+      chunks.push(encoder.encode("\r\n"));
+    }
+
+    chunks.push(encoder.encode(`--${boundary}--\r\n`));
+
+    const body = concatUint8Arrays(chunks);
+    const headers = this.buildHeaders();
+    delete headers["Content-Type"]; // let contentType option set it
+    delete headers.Accept;
+    headers.Accept = "application/json";
+
+    let attempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      let response;
+      let transportError = null;
+      try {
+        response = await requestUrl({
+          url,
+          method,
+          headers,
+          body: body.buffer,
+          contentType: `multipart/form-data; boundary=${boundary}`,
+          throw: false,
+        });
+      } catch (error) {
+        transportError = error;
+        response = { status: 0 };
+      }
+
+      const status = response.status || 0;
+      this.log({ url, method, status, attempt, multipart: true });
+
+      if (status >= 200 && status < 300) {
+        return { status, data: parseBody(response), headers: response.headers || {} };
+      }
+      if (status && !RETRYABLE_STATUS.has(status)) {
+        throw new DeckApiError(`Deck attachment upload failed (${status}).`, {
+          status,
+          url,
+          body: parseBody(response),
+        });
+      }
+      attempt += 1;
+      if (attempt > this.maxRetries) {
+        if (transportError) {
+          throw new DeckApiError(`Deck attachment upload unreachable: ${transportError.message || transportError}.`, { status: 0, url });
+        }
+        throw new DeckApiError(`Deck attachment upload kept failing (${status}).`, { status, url, body: parseBody(response) });
+      }
+      await sleep(Math.min(MAX_BACKOFF_MS, 1000 * (2 ** (attempt - 1))));
+    }
+  }
 }
 
 function pickHeader(response, name) {
@@ -3820,6 +3986,18 @@ function parseBody(response) {
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function concatUint8Arrays(chunks) {
+  let total = 0;
+  for (const chunk of chunks) total += chunk.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 module.exports = {
@@ -4321,6 +4499,273 @@ function preview(value) {
 module.exports = { ConflictModal };
 
   },
+  "src/attachment-sync.js": function(module, exports, __require) {
+const { normalizePath } = require("obsidian");
+
+// Two-way attachment sync for Nextcloud Deck.
+//
+// Storage layout in the vault:
+//   <boardFolder>/attachments/<cardId>/<filename>
+//
+// The plugin never mounts anything outside of that per-card directory so a
+// card delete cleans up its own files without touching unrelated notes. The
+// mapping from remote attachment id → local path lives on the card itself as
+// `card.attachments`, so a data.json restore round-trips.
+//
+// Uploads happen after the card create/update push so a brand-new card always
+// has a `remoteId` by the time we attach files. Downloads happen after every
+// pull so remote changes propagate. Tombstones are appended when the user
+// deletes a linked file locally, then drained on the next tick.
+
+const MIME_BY_EXT = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  bmp: "image/bmp",
+  avif: "image/avif",
+  ico: "image/x-icon",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  md: "text/markdown",
+  json: "application/json",
+  csv: "text/csv",
+  zip: "application/zip",
+  mp4: "video/mp4",
+  mp3: "audio/mpeg",
+};
+
+function guessMime(filename) {
+  const dot = String(filename || "").lastIndexOf(".");
+  if (dot < 0) return "application/octet-stream";
+  const ext = filename.slice(dot + 1).toLowerCase();
+  return MIME_BY_EXT[ext] || "application/octet-stream";
+}
+
+function sanitizeFilename(name) {
+  return String(name || "attachment")
+    .replace(/[\\/:*?"<>|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || "attachment";
+}
+
+function joinPath(...parts) {
+  return normalizePath(parts.filter(Boolean).join("/"));
+}
+
+class AttachmentSyncer {
+  constructor(plugin) {
+    this.plugin = plugin;
+  }
+
+  /**
+   * Pull all remote attachments for a card into the vault. Skips downloads
+   * whose remote id + updatedAt already match a local entry to avoid
+   * re-fetching unchanged files.
+   */
+  async pullCard(client, card, board, list) {
+    if (!this.isEnabled()) return { downloaded: 0 };
+    if (card.remoteId == null || board.remoteId == null || list.remoteId == null) return { downloaded: 0 };
+
+    let remoteAttachments = [];
+    try {
+      const { data } = await client.getAttachments(board.remoteId, list.remoteId, card.remoteId);
+      remoteAttachments = Array.isArray(data) ? data : [];
+    } catch (error) {
+      this.plugin.pushSyncLog({ event: "attachments-list-failed", cardId: card.id, message: (error && error.message) || String(error) });
+      return { downloaded: 0 };
+    }
+
+    if (!Array.isArray(card.attachments)) card.attachments = [];
+    const knownById = new Map(card.attachments.map((entry) => [entry.remoteId, entry]));
+    let downloaded = 0;
+
+    for (const remote of remoteAttachments) {
+      if (!remote || remote.id == null) continue;
+      const existing = knownById.get(remote.id);
+      const updatedAt = Number(remote.lastModified || 0);
+      if (existing && Number(existing.remoteUpdatedAt || 0) >= updatedAt && existing.filePath) {
+        // Already up to date; keep the metadata as-is.
+        knownById.delete(remote.id);
+        continue;
+      }
+
+      try {
+        const download = await client.downloadAttachment(board.remoteId, list.remoteId, card.remoteId, remote.id);
+        if (!download || !download.data) continue;
+        const filename = sanitizeFilename(remote.data || remote.name || `attachment-${remote.id}`);
+        const dir = joinPath(board.folderPath || "", "attachments", card.id);
+        await this.ensureDir(dir);
+        const filePath = await this.uniquePath(joinPath(dir, filename), existing ? existing.filePath : null);
+        await this.writeBinary(filePath, download.data);
+
+        const entry = existing || {};
+        entry.remoteId = remote.id;
+        entry.filePath = filePath;
+        entry.filename = filename;
+        entry.remoteUpdatedAt = updatedAt;
+        entry.contentType = download.contentType || "application/octet-stream";
+        if (!existing) card.attachments.push(entry);
+        knownById.delete(remote.id);
+        downloaded += 1;
+      } catch (error) {
+        this.plugin.pushSyncLog({
+          event: "attachment-download-failed",
+          cardId: card.id,
+          attachmentId: remote.id,
+          message: (error && error.message) || String(error),
+        });
+      }
+    }
+
+    // Anything left in knownById used to exist on Nextcloud but was removed
+    // there. Delete the local file and drop the entry.
+    for (const orphan of knownById.values()) {
+      await this.trashPath(orphan.filePath).catch(() => {});
+      card.attachments = card.attachments.filter((entry) => entry !== orphan);
+    }
+
+    return { downloaded };
+  }
+
+  /**
+   * Upload any files in the card's attachments directory that don't yet have
+   * a `remoteId`. Called after a card push so the card definitely exists on
+   * Nextcloud.
+   */
+  async pushCard(client, card, board, list) {
+    if (!this.isEnabled()) return { uploaded: 0 };
+    if (card.remoteId == null || board.remoteId == null || list.remoteId == null) return { uploaded: 0 };
+
+    const dir = joinPath(board.folderPath || "", "attachments", card.id);
+    const dirRef = this.plugin.app.vault.getAbstractFileByPath(dir);
+    if (!dirRef || !dirRef.children) return { uploaded: 0 };
+
+    if (!Array.isArray(card.attachments)) card.attachments = [];
+    const knownByPath = new Map(card.attachments.filter((e) => e.filePath).map((entry) => [entry.filePath, entry]));
+
+    let uploaded = 0;
+    for (const child of dirRef.children) {
+      if (!child || child.children) continue; // skip nested directories
+      if (knownByPath.has(child.path)) continue; // already tracked
+      try {
+        const data = await this.plugin.app.vault.readBinary(child);
+        const filename = sanitizeFilename(child.name);
+        const { data: response } = await client.uploadAttachment(board.remoteId, list.remoteId, card.remoteId, {
+          data: new Uint8Array(data),
+          filename,
+          mimeType: guessMime(filename),
+        });
+        if (!response || response.id == null) continue;
+        card.attachments.push({
+          remoteId: response.id,
+          filePath: child.path,
+          filename,
+          remoteUpdatedAt: Number(response.lastModified || Date.now()),
+          contentType: guessMime(filename),
+        });
+        uploaded += 1;
+      } catch (error) {
+        this.plugin.pushSyncLog({
+          event: "attachment-upload-failed",
+          cardId: card.id,
+          filename: child.name,
+          message: (error && error.message) || String(error),
+        });
+      }
+    }
+    return { uploaded };
+  }
+
+  /**
+   * Drain the attachment tombstone queue. Best-effort: 404 counts as success
+   * so a race with a remote deletion doesn't leave stale entries.
+   */
+  async reap(client) {
+    if (!this.isEnabled()) return 0;
+    const nc = this.plugin.data.nextcloud;
+    if (!Array.isArray(nc.pendingAttachmentDeletions) || !nc.pendingAttachmentDeletions.length) return 0;
+    const remaining = [];
+    let removed = 0;
+    for (const entry of nc.pendingAttachmentDeletions) {
+      try {
+        await client.deleteAttachment(entry.boardRemoteId, entry.stackRemoteId, entry.cardRemoteId, entry.attachmentRemoteId);
+        removed += 1;
+      } catch (error) {
+        if (error && error.status === 404) {
+          removed += 1;
+          continue;
+        }
+        this.plugin.pushSyncLog({ event: "attachment-reap-failed", entry, message: (error && error.message) || String(error) });
+        remaining.push(entry);
+      }
+    }
+    nc.pendingAttachmentDeletions = remaining;
+    return removed;
+  }
+
+  // ---- Local filesystem helpers ------------------------------------------
+
+  isEnabled() {
+    return !!(this.plugin.data.nextcloud && this.plugin.data.nextcloud.attachmentsEnabled);
+  }
+
+  async ensureDir(path) {
+    if (!path) return;
+    const existing = this.plugin.app.vault.getAbstractFileByPath(path);
+    if (existing) return;
+    // createFolder throws if any ancestor is missing; walk the path.
+    const parts = path.split("/");
+    let running = "";
+    for (const part of parts) {
+      running = running ? `${running}/${part}` : part;
+      if (this.plugin.app.vault.getAbstractFileByPath(running)) continue;
+      try { await this.plugin.app.vault.createFolder(running); }
+      catch (error) { /* concurrent create is fine */ }
+    }
+  }
+
+  async writeBinary(path, data) {
+    const existing = this.plugin.app.vault.getAbstractFileByPath(path);
+    const bytes = data instanceof ArrayBuffer ? data : (data && data.buffer) || data;
+    if (existing && existing.extension !== undefined) {
+      await this.plugin.app.vault.modifyBinary(existing, bytes);
+    } else {
+      await this.plugin.app.vault.createBinary(path, bytes);
+    }
+  }
+
+  async trashPath(path) {
+    if (!path) return;
+    const file = this.plugin.app.vault.getAbstractFileByPath(path);
+    if (!file) return;
+    await this.plugin.app.vault.trash(file, true);
+  }
+
+  async uniquePath(desiredPath, allowedExisting) {
+    if (desiredPath === allowedExisting) return desiredPath;
+    if (!this.plugin.app.vault.getAbstractFileByPath(desiredPath)) return desiredPath;
+    // Append " (n)" before the extension until we find a free slot.
+    const dot = desiredPath.lastIndexOf(".");
+    const base = dot > 0 ? desiredPath.slice(0, dot) : desiredPath;
+    const ext = dot > 0 ? desiredPath.slice(dot) : "";
+    for (let n = 2; n < 999; n += 1) {
+      const candidate = `${base} (${n})${ext}`;
+      if (!this.plugin.app.vault.getAbstractFileByPath(candidate) || candidate === allowedExisting) return candidate;
+    }
+    return `${base} (${Date.now()})${ext}`;
+  }
+}
+
+module.exports = {
+  AttachmentSyncer,
+  guessMime,
+  sanitizeFilename,
+};
+
+  },
   "src/sync-manager.js": function(module, exports, __require) {
 const {
   remoteBoardToLocal,
@@ -4333,6 +4778,7 @@ const {
 const { DeckApiError } = __require("src/deck-client.js");
 const { detectFieldConflicts, applyPolicy, snapshotBaseline } = __require("src/conflict.js");
 const { ConflictModal } = __require("src/conflict-modal.js");
+const { AttachmentSyncer } = __require("src/attachment-sync.js");
 
 // Coordinates two-way sync with Nextcloud Deck.
 //
@@ -4357,6 +4803,7 @@ class SyncManager {
     this.plugin = plugin;
     this.status = { state: STATUS_IDLE, at: 0, message: "" };
     this.running = null;
+    this.attachments = new AttachmentSyncer(plugin);
   }
 
   getStatus() { return this.status; }
@@ -4411,6 +4858,7 @@ class SyncManager {
 
       // ---- Phase 3: Reap deletions ----------------------------------------
       const reaped = await this.reapDeletions(client);
+      const attachmentsReaped = await this.attachments.reap(client);
 
       this.plugin.data.nextcloud.lastSyncAt = Date.now();
       await this.plugin.savePluginData();
@@ -4419,6 +4867,7 @@ class SyncManager {
       const parts = [`Pulled ${remoteBoards.length} board${remoteBoards.length === 1 ? "" : "s"}`];
       if (pushed) parts.push(`pushed ${pushed} card${pushed === 1 ? "" : "s"}`);
       if (reaped) parts.push(`deleted ${reaped} remote card${reaped === 1 ? "" : "s"}`);
+      if (attachmentsReaped) parts.push(`removed ${attachmentsReaped} attachment${attachmentsReaped === 1 ? "" : "s"}`);
       if (conflicts) parts.push(`${conflicts} conflict${conflicts === 1 ? "" : "s"} skipped`);
 
       this.status = { state: STATUS_OK, at: Date.now(), message: `${parts.join(", ")}.` };
@@ -4485,6 +4934,13 @@ class SyncManager {
         this.plugin.data.cards[cardId] = merged;
         localList.cardIds.push(cardId);
         cardMap.delete(remoteCard.id);
+
+        // Fetch attachments for the card (only if feature-enabled).
+        try {
+          await this.attachments.pullCard(client, merged, localBoard, localList);
+        } catch (error) {
+          this.plugin.pushSyncLog({ event: "attachment-pull-failed", cardId, message: (error && error.message) || String(error) });
+        }
       }
     }
 
@@ -4560,6 +5016,9 @@ class SyncManager {
     if (!created) throw new Error("Empty response from createCard");
     this.applyRemoteToCard(card, created, localBoard.id, list.id);
     card.localDirty = false;
+    await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
+      this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
+    });
   }
 
   async pushUpdate(client, localBoard, list, card, remoteSnapshot, policy) {
@@ -4605,6 +5064,9 @@ class SyncManager {
     if (!updated) throw new Error("Empty response from updateCard");
     this.applyRemoteToCard(card, updated, localBoard.id, list.id);
     card.localDirty = false;
+    await this.attachments.pushCard(client, card, localBoard, list).catch((error) => {
+      this.plugin.pushSyncLog({ event: "attachment-push-failed", cardId: card.id, message: (error && error.message) || String(error) });
+    });
     return "pushed";
   }
 
@@ -4762,6 +5224,12 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     ["create", "modify", "rename", "delete"].forEach((eventName) => {
       this.registerEvent(this.app.vault.on(eventName, (file) => this.queueCardFolderSync(file, eventName)));
     });
+    // Independently, watch for local attachment deletions/renames so the sync
+    // manager can enqueue a Deck-side delete on the next tick. These events
+    // are ignored when the deleted file isn't inside a tracked card's
+    // attachments/ directory.
+    this.registerEvent(this.app.vault.on("delete", (file) => this.handleAttachmentDelete(file)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.handleAttachmentRename(file, oldPath)));
 
     // Reconcile card notes AFTER the workspace + metadata cache are ready, and
     // never let it reject onload(): a startup file error used to crash onload and
@@ -4856,6 +5324,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       if (card.baselineHash !== undefined) delete card.baselineHash;
       if (card.baseline === undefined) card.baseline = null;
       if (card.localDirty === undefined) card.localDirty = false;
+      if (!Array.isArray(card.attachments)) card.attachments = [];
     });
     this.data.boards.forEach((board) => {
       board.folderPath = board.folderPath || this.inferBoardFolder(board) || cardFileBaseName(board.name);
@@ -5049,6 +5518,61 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       stackRemoteId: list.remoteId,
       at: Date.now(),
     });
+    // Any attachments tied to this card also need to be reaped.
+    (card.attachments || []).forEach((attachment) => this.enqueueAttachmentDeletion(card, attachment));
+  }
+
+  /**
+   * Record an attachment deletion. Called both from card deletion and from
+   * the vault event handler when the user removes a file directly.
+   */
+  enqueueAttachmentDeletion(card, attachment) {
+    if (!card || !attachment || attachment.remoteId == null) return;
+    const board = this.data.boards.find((b) => b.id === card.boardId);
+    if (!board || board.remoteId == null) return;
+    const list = board.lists.find((l) => l.id === card.listId);
+    if (!list || list.remoteId == null) return;
+    if (card.remoteId == null) return;
+    const nc = this.data.nextcloud;
+    if (!Array.isArray(nc.pendingAttachmentDeletions)) nc.pendingAttachmentDeletions = [];
+    if (nc.pendingAttachmentDeletions.some((entry) => entry.attachmentRemoteId === attachment.remoteId)) return;
+    nc.pendingAttachmentDeletions.push({
+      attachmentRemoteId: attachment.remoteId,
+      cardRemoteId: card.remoteId,
+      stackRemoteId: list.remoteId,
+      boardRemoteId: board.remoteId,
+      at: Date.now(),
+    });
+  }
+
+  /**
+   * Vault delete handler: identifies whether the removed file matches a
+   * tracked attachment and, if so, enqueues the remote deletion and drops the
+   * entry from the card.
+   */
+  handleAttachmentDelete(file) {
+    if (!file || !file.path) return;
+    for (const card of Object.values(this.data.cards || {})) {
+      if (!Array.isArray(card.attachments)) continue;
+      const idx = card.attachments.findIndex((entry) => entry && entry.filePath === file.path);
+      if (idx < 0) continue;
+      const [removed] = card.attachments.splice(idx, 1);
+      this.enqueueAttachmentDeletion(card, removed);
+      this.saveData(this.data).catch(() => {});
+      return;
+    }
+  }
+
+  handleAttachmentRename(file, oldPath) {
+    if (!file || !file.path || !oldPath) return;
+    for (const card of Object.values(this.data.cards || {})) {
+      if (!Array.isArray(card.attachments)) continue;
+      const entry = card.attachments.find((att) => att && att.filePath === oldPath);
+      if (!entry) continue;
+      entry.filePath = file.path;
+      this.saveData(this.data).catch(() => {});
+      return;
+    }
   }
 
   /**

@@ -55,7 +55,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Board folders")
-      .setDesc("Each board stores its Markdown cards in a folder named after that board.");
+      .setDesc("Each board stores its Markdown cards in a folder named after that board. New notes you drop into those folders will be picked up on the next Nextcloud sync.");
 
     new Setting(containerEl)
       .setName("Open board")
@@ -65,19 +65,6 @@ class TaskDeckSettingTab extends PluginSettingTab {
           .setButtonText("Open")
           .setCta()
           .onClick(() => this.plugin.activateView());
-      });
-
-    new Setting(containerEl)
-      .setName("Sync card notes")
-      .setDesc("Import Markdown cards created outside the board inside the card folder.")
-      .addButton((button) => {
-        button
-          .setButtonText("Sync now")
-          .onClick(async () => {
-            await this.plugin.syncCardsFromFolder();
-            this.plugin.refreshViews();
-            new Notice("Nextcloud Deck synced.");
-          });
       });
 
     this.renderNextcloudSection(containerEl);

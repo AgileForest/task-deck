@@ -3307,7 +3307,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Board folders")
-      .setDesc("Each board stores its Markdown cards in a folder named after that board.");
+      .setDesc("Each board stores its Markdown cards in a folder named after that board. New notes you drop into those folders will be picked up on the next Nextcloud sync.");
 
     new Setting(containerEl)
       .setName("Open board")
@@ -3317,19 +3317,6 @@ class TaskDeckSettingTab extends PluginSettingTab {
           .setButtonText("Open")
           .setCta()
           .onClick(() => this.plugin.activateView());
-      });
-
-    new Setting(containerEl)
-      .setName("Sync card notes")
-      .setDesc("Import Markdown cards created outside the board inside the card folder.")
-      .addButton((button) => {
-        button
-          .setButtonText("Sync now")
-          .onClick(async () => {
-            await this.plugin.syncCardsFromFolder();
-            this.plugin.refreshViews();
-            new Notice("Nextcloud Deck synced.");
-          });
       });
 
     this.renderNextcloudSection(containerEl);
@@ -5831,6 +5818,16 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
    *  manager will surface a status message instead of throwing. */
   async runNextcloudSync({ manual = false } = {}) {
     if (!this.isNextcloudEnabled()) return { state: "idle", at: Date.now(), message: "Not connected." };
+    // Absorb any orphan Markdown cards the user (or another plugin) dropped
+    // into board folders before we ship state to Nextcloud. This is what the
+    // old "Sync card notes" button used to do; folding it in here means users
+    // only need one button and can't end up out of sync.
+    try {
+      await this.syncCardsFromFolder();
+    } catch (error) {
+      // Non-fatal: proceed with the network sync even if folder scan blows up.
+      this.pushSyncLog({ event: "folder-scan-failed", message: (error && error.message) || String(error) });
+    }
     const manager = this.getSyncManager();
     return manager.runPull({ manual });
   }

@@ -272,6 +272,46 @@ class TaskDeckSettingTab extends PluginSettingTab {
   }
 
   renderSyncPreferences(containerEl, nextcloud) {
+    // Vault-relative root folder for every synced board. Made configurable
+    // because vaults sometimes have a reserved top-level folder — macOS
+    // Notes.app / iCloud sync clients / existing project layouts. Empty
+    // means "put boards at the vault root".
+    new Setting(containerEl)
+      .setName("Board root folder")
+      .setDesc('Vault-relative folder that hosts every synced board. Leave empty to place boards at the vault root. Default: "Deck". Changing this only affects newly created / pulled boards; existing boards keep their current path — use "Move existing boards" below to migrate them.')
+      .addText((text) => {
+        text
+          .setPlaceholder("Deck")
+          .setValue(String(nextcloud.rootFolder != null ? nextcloud.rootFolder : "Deck"))
+          .onChange(async (value) => {
+            const cleaned = String(value || "").trim().replace(/^\/+|\/+$/g, "");
+            this.plugin.data.nextcloud = Object.assign({}, this.plugin.data.nextcloud, {
+              rootFolder: cleaned,
+            });
+            await this.plugin.saveData(this.plugin.data);
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Move existing boards")
+      .setDesc("Move every synced board (folder, cards, attachments) into the Board root folder above. Cards inside Obsidian and links stay intact.")
+      .addButton((button) => {
+        button.setButtonText("Move now").onClick(async () => {
+          button.setDisabled(true);
+          try {
+            const moved = await this.plugin.migrateBoardRoots();
+            new Notice(moved
+              ? `Moved ${moved} board folder${moved === 1 ? "" : "s"} to the new root.`
+              : "Nothing to move — every board is already under the current root.");
+          } catch (error) {
+            new Notice(`Move failed: ${(error && error.message) || error}`);
+          } finally {
+            button.setDisabled(false);
+            this.display();
+          }
+        });
+      });
+
     new Setting(containerEl)
       .setName("Sync interval")
       .setDesc("How often to poll Nextcloud for remote changes.")

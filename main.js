@@ -61,6 +61,12 @@ const DEFAULT_NEXTCLOUD = {
   // Attachments are Phase 2 territory; the toggle is here so the data schema
   // is stable now and settings can flip it once implemented.
   attachmentsEnabled: false,
+  // Vault-relative folder used as the parent for every board created / pulled
+  // from Nextcloud. User-configurable via the settings tab so vaults with a
+  // reserved top-level folder (macOS Notes.app, existing "Nextcloud Deck"
+  // trees, etc.) can pick something safe. Leave empty to place boards at the
+  // vault root.
+  rootFolder: "Deck",
   // Cards deleted locally that still need their remote counterpart torn down
   // on the next push. Shape: [{ remoteId, boardRemoteId, stackRemoteId, at }].
   pendingDeletions: [],
@@ -3528,6 +3534,46 @@ class TaskDeckSettingTab extends PluginSettingTab {
   }
 
   renderSyncPreferences(containerEl, nextcloud) {
+    // Vault-relative root folder for every synced board. Made configurable
+    // because vaults sometimes have a reserved top-level folder — macOS
+    // Notes.app / iCloud sync clients / existing project layouts. Empty
+    // means "put boards at the vault root".
+    new Setting(containerEl)
+      .setName("Board root folder")
+      .setDesc('Vault-relative folder that hosts every synced board. Leave empty to place boards at the vault root. Default: "Deck". Changing this only affects newly created / pulled boards; existing boards keep their current path — use "Move existing boards" below to migrate them.')
+      .addText((text) => {
+        text
+          .setPlaceholder("Deck")
+          .setValue(String(nextcloud.rootFolder != null ? nextcloud.rootFolder : "Deck"))
+          .onChange(async (value) => {
+            const cleaned = String(value || "").trim().replace(/^\/+|\/+$/g, "");
+            this.plugin.data.nextcloud = Object.assign({}, this.plugin.data.nextcloud, {
+              rootFolder: cleaned,
+            });
+            await this.plugin.saveData(this.plugin.data);
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Move existing boards")
+      .setDesc("Move every synced board (folder, cards, attachments) into the Board root folder above. Cards inside Obsidian and links stay intact.")
+      .addButton((button) => {
+        button.setButtonText("Move now").onClick(async () => {
+          button.setDisabled(true);
+          try {
+            const moved = await this.plugin.migrateBoardRoots();
+            new Notice(moved
+              ? `Moved ${moved} board folder${moved === 1 ? "" : "s"} to the new root.`
+              : "Nothing to move — every board is already under the current root.");
+          } catch (error) {
+            new Notice(`Move failed: ${(error && error.message) || error}`);
+          } finally {
+            button.setDisabled(false);
+            this.display();
+          }
+        });
+      });
+
     new Setting(containerEl)
       .setName("Sync interval")
       .setDesc("How often to poll Nextcloud for remote changes.")
@@ -5386,7 +5432,13 @@ class SyncManager {
 
   suggestFolder(remoteBoard) {
     const title = String(remoteBoard.title || "Board").replace(/[\\/:*?"<>|]/g, " ").trim() || "Board";
-    return `Nextcloud Deck/${title}`;
+    // User-configurable root, defaults to "Deck". Empty string means "put
+    // boards at the vault root" — respect that literally.
+    const raw = this.plugin.data.nextcloud && Object.prototype.hasOwnProperty.call(this.plugin.data.nextcloud, "rootFolder")
+      ? this.plugin.data.nextcloud.rootFolder
+      : "Deck";
+    const root = typeof raw === "string" ? raw.trim().replace(/^\/+|\/+$/g, "") : "Deck";
+    return root ? `${root}/${title}` : title;
   }
 }
 
@@ -6594,6 +6646,83 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.refreshViews();
   }
 
+  /**
+   * Move every board folder under the current Nextcloud rootFolder setting.
+   * Boards already at the desired location are skipped. Card file paths and
+   * attachment paths are rewritten in-place so links and Deck-side references
+   * remain consistent. Returns the count of boards actually moved.
+   */
+  async migrateBoardRoots() {
+    const nc = this.data.nextcloud || {};
+    const rawRoot = typeof nc.rootFolder === "string" ? nc.rootFolder : "Deck";
+    const root = rawRoot.trim().replace(/^\/+|\/+$/g, "");
+
+    let moved = 0;
+    for (const board of this.data.boards) {
+      const currentFolder = board.folderPath || "";
+      const currentParent = currentFolder.includes("/") ? currentFolder.slice(0, currentFolder.lastIndexOf("/")) : "";
+      const boardBaseName = currentFolder.split("/").pop();
+      if (!boardBaseName) continue;
+      if (currentParent === root) continue; // already in the right place
+
+      // Ensure the root folder exists.
+      if (root && !this.app.vault.getAbstractFileByPath(root)) {
+        await this.app.vault.createFolder(root).catch(() => {});
+      }
+
+      // Compute the destination path, avoiding collisions with a same-named
+      // sibling that already lives under the new root.
+      const desiredBase = root ? `${root}/${boardBaseName}` : boardBaseName;
+      let desired = desiredBase;
+      let dedupe = 2;
+      while (desired !== currentFolder && this.app.vault.getAbstractFileByPath(desired)) {
+        desired = `${desiredBase} ${dedupe}`;
+        dedupe += 1;
+      }
+      if (desired === currentFolder) continue;
+
+      const folder = this.app.vault.getAbstractFileByPath(currentFolder);
+      if (folder) {
+        try {
+          await this.app.vault.rename(folder, desired);
+        } catch (error) {
+          this.pushSyncLog({
+            event: "migrate-board-root.failed",
+            boardId: board.id,
+            from: currentFolder,
+            to: desired,
+            message: (error && error.message) || String(error),
+          });
+          continue;
+        }
+      }
+
+      // Rewrite every card / attachment path that pointed into the old folder.
+      Object.values(this.data.cards).forEach((card) => {
+        if (card.boardId !== board.id) return;
+        if (card.filePath && card.filePath.startsWith(`${currentFolder}/`)) {
+          card.filePath = `${desired}/${card.filePath.slice(currentFolder.length + 1)}`;
+        }
+        if (Array.isArray(card.attachments)) {
+          card.attachments.forEach((att) => {
+            if (att && att.filePath && att.filePath.startsWith(`${currentFolder}/`)) {
+              att.filePath = `${desired}/${att.filePath.slice(currentFolder.length + 1)}`;
+            }
+          });
+        }
+      });
+      board.folderPath = desired;
+      moved += 1;
+      this.pushSyncLog({ event: "migrate-board-root.done", boardId: board.id, to: desired });
+    }
+
+    if (moved) {
+      await this.savePluginData();
+      this.refreshViews();
+    }
+    return moved;
+  }
+
   addList() {
     if (!this.getBoard()) {
       this.createBoardPrompt();
@@ -7336,14 +7465,23 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     // when a card entered `data.cards` from Nextcloud pull without ever
     // having a note materialized (remoteCardToLocal returns filePath="").
     // Without this guard, adapter.write("") targets the vault root and
-    // Node throws EISDIR.
+    // Node throws EISDIR. We surface an event so debug logs make the
+    // recovery visible instead of silently deciding a path.
     if (!card.filePath || !/\.md$/i.test(card.filePath)) {
+      if (!board) {
+        // We really cannot invent a location without at least a board — bail
+        // loudly rather than write into the vault root.
+        const err = new Error("Card has no board folder assigned. Reload after the next Nextcloud sync.");
+        this.pushSyncLog({ event: "writeCardFile.no-board", cardId: card.id, filePath: card.filePath });
+        throw err;
+      }
       const generated = await this.nextCardPath(card.title || "Untitled card", null, board);
-      this.debugLog({
+      this.pushSyncLog({
         event: "writeCardFile.assign-path",
         cardId: card.id,
         oldPath: card.filePath,
         newPath: generated,
+        boardFolder: board.folderPath,
       });
       card.filePath = generated;
     }

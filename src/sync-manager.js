@@ -392,7 +392,13 @@ class SyncManager {
 
   suggestFolder(remoteBoard) {
     const title = String(remoteBoard.title || "Board").replace(/[\\/:*?"<>|]/g, " ").trim() || "Board";
-    return `Nextcloud Deck/${title}`;
+    // User-configurable root, defaults to "Deck". Empty string means "put
+    // boards at the vault root" — respect that literally.
+    const raw = this.plugin.data.nextcloud && Object.prototype.hasOwnProperty.call(this.plugin.data.nextcloud, "rootFolder")
+      ? this.plugin.data.nextcloud.rootFolder
+      : "Deck";
+    const root = typeof raw === "string" ? raw.trim().replace(/^\/+|\/+$/g, "") : "Deck";
+    return root ? `${root}/${title}` : title;
   }
 }
 

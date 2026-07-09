@@ -58,6 +58,12 @@ const DEFAULT_NEXTCLOUD = {
   // Attachments are Phase 2 territory; the toggle is here so the data schema
   // is stable now and settings can flip it once implemented.
   attachmentsEnabled: false,
+  // Vault-relative folder used as the parent for every board created / pulled
+  // from Nextcloud. User-configurable via the settings tab so vaults with a
+  // reserved top-level folder (macOS Notes.app, existing "Nextcloud Deck"
+  // trees, etc.) can pick something safe. Leave empty to place boards at the
+  // vault root.
+  rootFolder: "Deck",
   // Cards deleted locally that still need their remote counterpart torn down
   // on the next push. Shape: [{ remoteId, boardRemoteId, stackRemoteId, at }].
   pendingDeletions: [],

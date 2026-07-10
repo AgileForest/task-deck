@@ -1941,3 +1941,91 @@
   font-style: italic;
 }
 
+/* ---- Card modal: Attachments panel ------------------------------------ */
+.ot-attachments-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ot-attachments-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ot-attachments-heading .ot-attachments-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.ot-attachments-count {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+.ot-attachments-heading > button {
+  margin-left: auto;
+}
+.ot-attachments-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 8px;
+}
+.ot-attachments-empty {
+  color: var(--text-muted);
+  padding: 8px;
+  text-align: center;
+  font-style: italic;
+}
+.ot-attachment-tile {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--background-primary);
+}
+.ot-attachment-tile.is-pending {
+  border-style: dashed;
+}
+.ot-attachment-thumb {
+  aspect-ratio: 16 / 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-secondary);
+  overflow: hidden;
+}
+.ot-attachment-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: cover;
+}
+.ot-attachment-icon {
+  font-size: 28px;
+  color: var(--text-muted);
+  display: inline-flex;
+}
+.ot-attachment-meta {
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ot-attachment-name {
+  font-size: 0.9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ot-attachment-pending {
+  font-size: 0.75em;
+  color: var(--text-accent);
+  font-style: italic;
+}
+.ot-attachment-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  padding: 4px 6px;
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+

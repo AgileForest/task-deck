@@ -24,6 +24,7 @@ const {
   textButton,
   textLine,
 } = require("./helpers");
+const { guessMime } = require("./attachment-sync");
 
 // Pull image files out of a paste/drop DataTransfer (empty if none).
 function imageFilesFromTransfer(dt) {
@@ -751,6 +752,7 @@ class CardModal extends Modal {
 
     const labelsField = this.renderLabelsField();
     const detailsField = this.renderDetailsField();
+    const attachmentsField = this.renderAttachmentsField();
     const checklistField = this.renderChecklistField();
 
     const actions = createElement("div", "ot-modal-actions");
@@ -784,7 +786,7 @@ class CardModal extends Modal {
 
     actions.append(deleteButton, openNote, close);
 
-    this.contentEl.append(title, labelsField, detailsField, checklistField, actions);
+    this.contentEl.append(title, labelsField, detailsField, attachmentsField, checklistField, actions);
 
     if (!this.editingDetails) {
       requestAnimationFrame(() => title.focus());
@@ -1348,6 +1350,10 @@ class CardModal extends Modal {
       // Persist the binary and its embed together (not just the debounced save),
       // so a crash right after can't leave an unreferenced attachment.
       await this.saveNow();
+      // Reflect the new file in the Attachments panel immediately — the
+      // panel's render() also scans the per-card directory so the tile
+      // shows up as "pending upload" until the next sync.
+      if (this.attachmentsRefresh) this.attachmentsRefresh();
     } catch (error) {
       console.error(error);
       new Notice("Couldn't add the image.");
@@ -1392,6 +1398,147 @@ class CardModal extends Modal {
       embed.replaceChildren(img);
       embed.classList.add("image-embed", "media-embed", "is-loaded");
     });
+  }
+
+  /**
+   * Renders the "Attachments" panel below the description. Lists items
+   * from `card.attachments[]` plus any local files in the per-card
+   * attachment folder that haven't yet been ingested by attachment-sync
+   * (they show up before the next sync round). Each tile supports opening
+   * the file in a new pane and moving it to trash — deletion goes through
+   * `app.vault.trash()` so the plugin's existing `handleAttachmentDelete`
+   * hook enqueues the remote reap without any extra plumbing here.
+   */
+  renderAttachmentsField() {
+    const field = createElement("section", "ot-field ot-attachments-field");
+    const header = createElement("div", "ot-attachments-heading");
+    const icon = createElement("span", "ot-attachments-icon");
+    try { setIcon(icon, "paperclip"); } catch (error) { icon.textContent = ""; }
+    const titleEl = createElement("span", "", "Attachments");
+    const count = createElement("span", "ot-attachments-count", "");
+    const addBtn = iconButton("plus", "Add attachment", () => this.triggerAttachmentUpload());
+    header.append(icon, titleEl, count, addBtn);
+
+    const list = createElement("div", "ot-attachments-list");
+
+    const render = () => {
+      list.replaceChildren();
+
+      // Union of tracked attachments (with fileid/remoteId) and any file
+      // still sitting in the per-card attachment folder locally. We show
+      // both so the user can immediately see a screenshot they just
+      // pasted, even though sync hasn't uploaded it yet.
+      const tracked = Array.isArray(this.card.attachments) ? this.card.attachments : [];
+      const seenPaths = new Set(tracked.filter((a) => a && a.filePath).map((a) => a.filePath));
+
+      const board = this.plugin.findBoardForCard(this.card);
+      const pending = [];
+      if (board && board.folderPath && this.card && this.card.id) {
+        const dir = `${board.folderPath}/attachments/${this.card.id}`;
+        const dirRef = this.app.vault.getAbstractFileByPath(dir);
+        if (dirRef && dirRef.children) {
+          for (const child of dirRef.children) {
+            if (!child || child.children) continue; // skip folders
+            if (seenPaths.has(child.path)) continue;
+            pending.push({
+              filePath: child.path,
+              filename: child.name,
+              contentType: guessMime(child.name),
+              pending: true,
+            });
+          }
+        }
+      }
+
+      const items = tracked.concat(pending);
+      count.textContent = items.length ? `(${items.length})` : "";
+      if (!items.length) {
+        list.append(createElement("div", "ot-attachments-empty", "No attachments"));
+        return;
+      }
+      for (const att of items) {
+        list.append(this.buildAttachmentTile(att, render));
+      }
+    };
+
+    this.attachmentsRefresh = render;
+    render();
+    field.append(header, list);
+    return field;
+  }
+
+  buildAttachmentTile(attachment, onRefresh) {
+    const tile = createElement("div", "ot-attachment-tile");
+    if (attachment.pending) tile.addClass("is-pending");
+    const file = attachment.filePath ? this.app.vault.getAbstractFileByPath(attachment.filePath) : null;
+    const isImage = /^image\//i.test(attachment.contentType || "");
+
+    const thumb = createElement("div", "ot-attachment-thumb");
+    if (file && isImage && typeof this.app.vault.getResourcePath === "function") {
+      const img = createElement("img", "ot-attachment-image");
+      img.src = this.app.vault.getResourcePath(file);
+      img.alt = attachment.filename || "";
+      thumb.append(img);
+    } else {
+      const iconEl = createElement("span", "ot-attachment-icon");
+      try { setIcon(iconEl, isImage ? "image" : "file"); } catch (error) { iconEl.textContent = ""; }
+      thumb.append(iconEl);
+    }
+
+    const meta = createElement("div", "ot-attachment-meta");
+    const name = createElement("div", "ot-attachment-name", attachment.filename || "unnamed");
+    name.title = attachment.filePath || attachment.filename || "";
+    meta.append(name);
+    if (attachment.pending) {
+      meta.append(createElement("div", "ot-attachment-pending", "pending upload"));
+    }
+
+    const actions = createElement("div", "ot-attachment-actions");
+    const openBtn = iconButton("external-link", "Open", async () => {
+      if (!file) {
+        new Notice("File no longer exists in the vault.");
+        return;
+      }
+      try {
+        await this.app.workspace.getLeaf(true).openFile(file);
+      } catch (error) {
+        new Notice(`Open failed: ${(error && error.message) || error}`);
+      }
+    });
+    const delBtn = iconButton("trash", "Delete", async () => {
+      const label = attachment.filename || attachment.filePath || "this file";
+      if (!window.confirm(`Remove "${label}"? The linked file will be moved to trash.`)) return;
+      if (file) {
+        try { await this.app.vault.trash(file, true); }
+        catch (error) { new Notice(`Delete failed: ${(error && error.message) || error}`); return; }
+      } else if (Array.isArray(this.card.attachments)) {
+        // File already missing from disk (e.g. moved manually); still
+        // drop the tracking entry so the UI clears and reap runs next
+        // sync.
+        const idx = this.card.attachments.indexOf(attachment);
+        if (idx >= 0) this.card.attachments.splice(idx, 1);
+      }
+      this.plugin.markCardDirty(this.card);
+      try { await this.plugin.saveData(this.plugin.data); } catch (error) { /* best-effort */ }
+      onRefresh();
+    });
+    actions.append(openBtn, delBtn);
+
+    tile.append(thumb, meta, actions);
+    return tile;
+  }
+
+  triggerAttachmentUpload() {
+    if (this.readOnly) return;
+    const input = createElement("input", "ot-hidden-file-input");
+    input.type = "file";
+    input.multiple = true;
+    input.addEventListener("change", async () => {
+      const files = Array.from(input.files || []);
+      for (const f of files) await this.insertImageFromFile(f);
+      if (this.attachmentsRefresh) this.attachmentsRefresh();
+    });
+    input.click();
   }
 
   /**

@@ -5460,22 +5460,35 @@ class SyncManager {
 
   async pullBoard(client, remoteBoard, localBoardId) {
     const localBoard = this.plugin.data.boards.find((board) => board.id === localBoardId);
+    // Deck's /boards list endpoint returns a slim board object without
+    // the full label catalog on some deployments (Nextcloud config
+    // dependent). Refetch the individual board so we always have
+    // `remoteBoard.labels` populated — otherwise pushCardLabels ends up
+    // trying to create labels that Deck already has, and Deck responds
+    // with a duplicate-title 400.
+    let hydrated = remoteBoard;
+    try {
+      const { data: full } = await client.getBoard(remoteBoard.id);
+      if (full) hydrated = full;
+    } catch (error) {
+      this.plugin.pushSyncLog({ event: "board-hydrate-failed", boardId: remoteBoard.id, message: (error && error.message) || String(error) });
+    }
     if (!localBoard) {
-      const { data: stacks } = await client.getStacks(remoteBoard.id);
-      const created = remoteBoardToLocal(remoteBoard, stacks || [], {
+      const { data: stacks } = await client.getStacks(hydrated.id);
+      const created = remoteBoardToLocal(hydrated, stacks || [], {
         boardId: localBoardId,
-        folderPath: this.suggestFolder(remoteBoard),
+        folderPath: this.suggestFolder(hydrated),
       });
       this.plugin.data.boards.push(created);
-      await this.pullCards(client, remoteBoard.id, created, stacks || []);
+      await this.pullCards(client, hydrated.id, created, stacks || []);
       return stacks || [];
     }
 
-    const { data: stacks } = await client.getStacks(remoteBoard.id);
-    const reconciled = reconcileBoardStructure(localBoard, remoteBoard, stacks || []);
+    const { data: stacks } = await client.getStacks(hydrated.id);
+    const reconciled = reconcileBoardStructure(localBoard, hydrated, stacks || []);
     const index = this.plugin.data.boards.indexOf(localBoard);
     this.plugin.data.boards[index] = reconciled;
-    await this.pullCards(client, remoteBoard.id, reconciled, stacks || []);
+    await this.pullCards(client, hydrated.id, reconciled, stacks || []);
     return stacks || [];
   }
 
@@ -5850,8 +5863,28 @@ class SyncManager {
             this.plugin.debugLog({ event: "labels.created", boardId: localBoard.id, title: local.name, remoteId: catalog.remoteId });
           }
         } catch (error) {
-          this.plugin.pushSyncLog({ event: "labels.create-failed", boardId: localBoard.id, title: local.name, message: (error && error.message) || String(error) });
-          continue;
+          // A 400 usually means "label with this title already exists" —
+          // our catalog was stale. Try to recover by pulling the board's
+          // full label list and matching on title before giving up.
+          if (error && error.status === 400) {
+            try {
+              const { data: freshBoard } = await client.getBoard(remoteBoard(localBoard));
+              const freshLabels = Array.isArray(freshBoard && freshBoard.labels) ? freshBoard.labels : [];
+              const match = freshLabels.find((l) => String((l && l.title) || "").toLowerCase() === key);
+              if (match && match.id != null) {
+                catalog = { remoteId: Number(match.id), title: match.title || local.name, color: local.color || "#31CC7C" };
+                localBoard.labels.push(catalog);
+                catalogByTitle.set(key, catalog);
+                this.plugin.debugLog({ event: "labels.recovered-existing", boardId: localBoard.id, title: local.name, remoteId: catalog.remoteId });
+              }
+            } catch (retryError) {
+              // Fall through to the generic failure log.
+            }
+          }
+          if (!catalog) {
+            this.plugin.pushSyncLog({ event: "labels.create-failed", boardId: localBoard.id, title: local.name, message: (error && error.message) || String(error) });
+            continue;
+          }
         }
       }
       if (!catalog || catalog.remoteId == null) continue;

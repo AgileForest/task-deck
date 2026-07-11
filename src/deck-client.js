@@ -48,7 +48,7 @@ class DeckClient {
     this.username = options.username;
     this.appPassword = options.appPassword;
     this.maxRetries = Number.isFinite(options.maxRetries) ? options.maxRetries : 4;
-    this.userAgent = options.userAgent || "Obsidian Nextcloud Deck";
+    this.userAgent = options.userAgent || "NextDeck";
     this.logger = typeof options.logger === "function" ? options.logger : null;
   }
 

@@ -48,7 +48,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.addClass("ot-settings");
 
-    containerEl.createEl("h2", { text: "Obsidian Nextcloud Deck" });
+    containerEl.createEl("h2", { text: "NextDeck" });
     containerEl.createEl("p", {
       text: "Kanban boards backed by Markdown notes in your vault, with optional Nextcloud Deck sync.",
     });

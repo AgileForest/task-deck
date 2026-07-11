@@ -1,5 +1,5 @@
 {
-  "id": "obsidian-nextcloud-deck",
+  "id": "nextdeck",
   "name": "NextDeck",
   "author": "onlymykazari",
   "description": "Markdown-backed kanban boards with two-way Nextcloud Deck sync.",

@@ -3478,7 +3478,7 @@ async function startLoginFlow(serverUrl) {
     method: "POST",
     headers: {
       "OCS-APIRequest": "true",
-      "User-Agent": "Obsidian Nextcloud Deck",
+      "User-Agent": "NextDeck",
     },
     throw: false,
   });
@@ -3836,7 +3836,7 @@ class TaskDeckSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.addClass("ot-settings");
 
-    containerEl.createEl("h2", { text: "Obsidian Nextcloud Deck" });
+    containerEl.createEl("h2", { text: "NextDeck" });
     containerEl.createEl("p", {
       text: "Kanban boards backed by Markdown notes in your vault, with optional Nextcloud Deck sync.",
     });
@@ -4354,7 +4354,7 @@ class DeckClient {
     this.username = options.username;
     this.appPassword = options.appPassword;
     this.maxRetries = Number.isFinite(options.maxRetries) ? options.maxRetries : 4;
-    this.userAgent = options.userAgent || "Obsidian Nextcloud Deck";
+    this.userAgent = options.userAgent || "NextDeck";
     this.logger = typeof options.logger === "function" ? options.logger : null;
   }
 
@@ -6840,7 +6840,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     try {
       appPassword = await this.loadNextcloudAppPassword();
     } catch (error) {
-      console.error("Obsidian Nextcloud Deck: could not decrypt saved App Password", error);
+      console.error("NextDeck: could not decrypt saved App Password", error);
       return null;
     }
     if (!appPassword) return null;

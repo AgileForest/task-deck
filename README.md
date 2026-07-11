@@ -35,7 +35,7 @@ Forked from [Task Deck](https://github.com/ismailivanov/task-deck) and refocused
 Download `main.js`, `manifest.json`, and `styles.css` from a [release](https://github.com/onlymykazari/obsidian-nextcloud-deck/releases) and place them here:
 
 ```
-Your Vault/.obsidian/plugins/obsidian-nextcloud-deck/
+Your Vault/.obsidian/plugins/nextdeck/
 ```
 
 Then enable **NextDeck** from *Community plugins*.

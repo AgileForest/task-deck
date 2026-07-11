@@ -393,7 +393,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     try {
       appPassword = await this.loadNextcloudAppPassword();
     } catch (error) {
-      console.error("Obsidian Nextcloud Deck: could not decrypt saved App Password", error);
+      console.error("NextDeck: could not decrypt saved App Password", error);
       return null;
     }
     if (!appPassword) return null;

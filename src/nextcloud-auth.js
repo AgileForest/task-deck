@@ -142,7 +142,7 @@ async function startLoginFlow(serverUrl) {
     method: "POST",
     headers: {
       "OCS-APIRequest": "true",
-      "User-Agent": "Obsidian Nextcloud Deck",
+      "User-Agent": "NextDeck",
     },
     throw: false,
   });

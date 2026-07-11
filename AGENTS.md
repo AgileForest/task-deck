@@ -6,7 +6,7 @@ Instructions for AI agents (Claude, Codex, Trae, Cursor, …) working on this re
 
 **NextDeck** — an Obsidian plugin that stores every kanban card as a real Markdown note in the vault, with optional two-way sync against a self-hosted [Nextcloud Deck](https://github.com/nextcloud/deck) instance.
 
-- Manifest id (never change): `obsidian-nextcloud-deck`
+- Manifest id (never change): `nextdeck`
 - Manifest display name: `NextDeck`
 - Entry point: `src/plugin.js` → bundled to `main.js` via `build.js`
 - Language: Vanilla JS (CommonJS), no TypeScript, no framework

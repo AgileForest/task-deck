@@ -1,5 +1,5 @@
 const { uid, cleanColor, cleanDate } = require("./helpers");
-const { snapshotBaseline } = require("./conflict");
+const { snapshotBaseline, signatureOfLabels } = require("./conflict");
 
 // Nextcloud Deck ↔ local board model translators.
 //
@@ -160,6 +160,21 @@ function mergeRemoteCardOntoLocal(existing, remoteCard, { boardId, listId }) {
     merged.completed = remote.completed;
     merged.dueDate = remote.dueDate;
     merged.startDate = remote.startDate;
+  } else {
+    // Local is dirty on *something* (title/details/etc.) but that doesn't
+    // mean labels are dirty. Deck's REST API doesn't return an assignedAt
+    // per label, so we approximate with a signature diff against the last
+    // baseline: if local labels still match the baseline signature, the
+    // user didn't touch them locally and the remote change wins. This is
+    // what fixes the "webui-changed label reverts on next sync" bug: pre-
+    // pre.20 we kept the stale local list wholesale whenever *any* local
+    // field was dirty, then pushCardLabels would re-assign the stale set
+    // and unassign whatever the webui had put on the card.
+    const baseSig = existing.baseline && existing.baseline.labelsSignature;
+    const localSig = signatureOfLabels(existing.labels);
+    if (baseSig != null && localSig === baseSig) {
+      merged.labels = remote.labels;
+    }
   }
   // Baseline always tracks the *remote* view so the next push has an accurate
   // starting point for 3-way diffs.

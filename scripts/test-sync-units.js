@@ -287,4 +287,58 @@ test("push+pull round-trip preserves the source string", () => {
   assert.strictEqual(roundtripped, original);
 });
 
+// ---- Label merge on dirty card ------------------------------------------
+//
+// Regression: pre-pre.20 kept the stale local labels wholesale whenever
+// any local field was dirty, causing webui-side label changes to revert
+// on next sync. Now the merge does a signature diff against baseline.
+
+test("mergeRemoteCardOntoLocal adopts remote labels when local labels match baseline (even if card is dirty)", () => {
+  const baseLabels = [{ name: "Old", color: "#111111" }];
+  const existing = {
+    id: "card-1",
+    remoteId: 11,
+    localDirty: true, // title changed locally, say
+    title: "Local title",
+    labels: [{ name: "Old", color: "#111111" }],
+    baseline: { title: "Original", labelsSignature: mapper.__signatureOfLabels
+      ? mapper.__signatureOfLabels(baseLabels)
+      : "old|#111111",
+    },
+  };
+  const remoteCard = {
+    id: 11,
+    title: "Original",
+    description: "",
+    labels: [{ id: 5, title: "New", color: "d43c35" }],
+    stackId: 1,
+  };
+  const merged = mapper.mergeRemoteCardOntoLocal(existing, remoteCard, { boardId: "b", listId: "l" });
+  // labels should be replaced with remote since local didn't diverge
+  assert.strictEqual(merged.labels.length, 1);
+  assert.strictEqual(merged.labels[0].name, "New");
+  // title stays local because it IS dirty relative to baseline
+  assert.strictEqual(merged.title, "Local title");
+});
+
+test("mergeRemoteCardOntoLocal preserves local labels when they diverge from baseline", () => {
+  const existing = {
+    id: "card-1",
+    remoteId: 11,
+    localDirty: true,
+    title: "T",
+    labels: [{ name: "LocalOnly", color: "#222222" }],
+    baseline: { title: "T", labelsSignature: "originalonly|#111111" },
+  };
+  const remoteCard = {
+    id: 11,
+    title: "T",
+    description: "",
+    labels: [{ id: 5, title: "RemoteOnly", color: "d43c35" }],
+    stackId: 1,
+  };
+  const merged = mapper.mergeRemoteCardOntoLocal(existing, remoteCard, { boardId: "b", listId: "l" });
+  assert.strictEqual(merged.labels[0].name, "LocalOnly");
+});
+
 console.log(`\n${passed} tests passed.`);

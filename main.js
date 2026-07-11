@@ -5550,6 +5550,7 @@ const { DeckApiError } = __require("src/deck-client.js");
 const { detectFieldConflicts, applyPolicy, snapshotBaseline } = __require("src/conflict.js");
 const { ConflictModal } = __require("src/conflict-modal.js");
 const { AttachmentSyncer } = __require("src/attachment-sync.js");
+const { labelKey } = __require("src/helpers.js");
 
 // Coordinates two-way sync with Nextcloud Deck.
 //
@@ -5683,6 +5684,7 @@ class SyncManager {
         folderPath: this.suggestFolder(hydrated),
       });
       this.plugin.data.boards.push(created);
+      this.mergeBoardLabelsIntoGlobal(created);
       await this.pullCards(client, hydrated.id, created, stacks || []);
       return stacks || [];
     }
@@ -5691,8 +5693,44 @@ class SyncManager {
     const reconciled = reconcileBoardStructure(localBoard, hydrated, stacks || []);
     const index = this.plugin.data.boards.indexOf(localBoard);
     this.plugin.data.boards[index] = reconciled;
+    this.mergeBoardLabelsIntoGlobal(reconciled);
     await this.pullCards(client, hydrated.id, reconciled, stacks || []);
     return stacks || [];
+  }
+
+  /**
+   * After hydrating a board, promote its per-board label catalog into the
+   * plugin's global `data.labels` list — that's what the LabelPicker modal
+   * shows when the user clicks the label button on a card. Without this
+   * step, labels created on the Deck Web UI would only exist inside
+   * `localBoard.labels` (which is only used for push-side reconciliation)
+   * and would never surface in the picker, giving the appearance that the
+   * local label list is a subset of what Deck has.
+   *
+   * Merge is done by `labelKey` (case-insensitive name) to avoid loading
+   * the picker with duplicates when the same title exists in both sources.
+   * `board.labels` uses `title`, `data.labels` uses `name`, so we adapt.
+   */
+  mergeBoardLabelsIntoGlobal(board) {
+    if (!board || !Array.isArray(board.labels)) return;
+    if (!Array.isArray(this.plugin.data.labels)) this.plugin.data.labels = [];
+    const seen = new Set(this.plugin.data.labels.map((l) => labelKey(l && l.name)));
+    let added = 0;
+    for (const boardLabel of board.labels) {
+      const name = boardLabel && (boardLabel.name || boardLabel.title);
+      if (!name) continue;
+      const key = labelKey(name);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      this.plugin.data.labels.push({
+        name: String(name).trim(),
+        color: (boardLabel && boardLabel.color) || "#d43c35",
+      });
+      added += 1;
+    }
+    if (added) {
+      this.plugin.debugLog({ event: "sync.pull.global-labels-added", boardId: board.id, added });
+    }
   }
 
   async pullCards(client, remoteBoardId, localBoard, remoteStacks) {

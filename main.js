@@ -5735,6 +5735,12 @@ class SyncManager {
 
   async pullCards(client, remoteBoardId, localBoard, remoteStacks) {
     const cardMap = new Map();
+    // Cards whose local model was refreshed from remote in this pull;
+    // we'll flush their md files at the end so open cards (which
+    // re-hydrate from disk via hydrateCardFromFile on modal load) see
+    // the same state as the board view. Without this the board tile
+    // shows the new label but opening the modal shows stale ones.
+    const dirtyForDisk = [];
     Object.values(this.plugin.data.cards).forEach((card) => {
       // Coerce to Number so a remoteId stored as string still matches a
       // number coming back from Deck (belt-and-suspenders; the API returns
@@ -5809,6 +5815,7 @@ class SyncManager {
         this.plugin.data.cards[cardId] = merged;
         localList.cardIds.push(cardId);
         cardMap.delete(remoteIdKey);
+        dirtyForDisk.push(merged);
         this.plugin.debugLog({
           event: "sync.pull.card",
           cardId,
@@ -5859,6 +5866,22 @@ class SyncManager {
       const list = localBoard.lists.find((l) => l.id === card.listId);
       if (list && !list.cardIds.includes(card.id)) list.cardIds.push(card.id);
     });
+
+    // Flush the refreshed cards back to their Markdown files. The card
+    // modal calls plugin.hydrateCardFromFile(card) on open, which reads
+    // labels/details/etc. from disk and overwrites the in-memory card —
+    // so if the md file is stale (which it always was pre-pre.22 for
+    // pull-only changes), the modal shows the old data even though the
+    // board view (which reads from data.cards directly) shows the new
+    // one. Best-effort per card; a single write failure shouldn't
+    // abort the rest of the sync.
+    for (const card of dirtyForDisk) {
+      try {
+        await this.plugin.writeCardFile(card);
+      } catch (error) {
+        this.plugin.pushSyncLog({ event: "card-writeback-failed", cardId: card.id, message: (error && error.message) || String(error) });
+      }
+    }
   }
 
   async fallbackFetchStackCards(client, boardId, stackId) {

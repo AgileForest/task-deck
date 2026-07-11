@@ -5630,7 +5630,17 @@ class SyncManager {
       // ---- Phase 1: Pull ----------------------------------------------------
       const { data: remoteBoards } = await client.getBoards();
       if (!Array.isArray(remoteBoards)) throw new Error("Unexpected boards response.");
-      this.plugin.debugLog({ event: "sync.pull.boards", count: remoteBoards.length });
+      this.plugin.debugLog({
+        event: "sync.pull.boards",
+        count: remoteBoards.length,
+        // Emit our own view of local state at sync start so we can diagnose
+        // "phantom boards multiplying". Users report empty boards appearing
+        // after every sync; log2.json alone can't disambiguate whether
+        // they were already in data.boards or created by this sync. This
+        // gives us a before-vs-after picture per sync.
+        localBoards: this.plugin.data.boards.length,
+        bindings: Object.keys(this.plugin.data.nextcloud.boardBindings || {}).length,
+      });
 
       const bindings = this.getBindings();
       const boardMap = new Map(this.plugin.data.boards.map((board) => [board.id, board]));
@@ -5652,6 +5662,15 @@ class SyncManager {
 
       this.plugin.data.nextcloud.boardBindings = bindings;
 
+      // Prune stale duplicate boards. Root cause: an older/buggy code
+      // path (or a partial restore from vault index files) can leave
+      // data.boards with more than one entry for the same remote board
+      // (same folderPath, or same remoteId, or an unbound name-clone).
+      // Reported symptom: empty phantom boards multiply in the tab bar
+      // after each sync. Collapsing here is safe because we do it AFTER
+      // pull has already merged remote content onto the bound copies.
+      this.pruneDuplicateBoards(boundLocalIds);
+
       // ---- Phase 2: Push ---------------------------------------------------
       let pushed = 0;
       let conflicts = 0;
@@ -5668,6 +5687,34 @@ class SyncManager {
       const attachmentsReaped = await this.attachments.reap(client);
 
       this.plugin.data.nextcloud.lastSyncAt = Date.now();
+
+      // Rewrite the board index files so their embedded list metadata matches
+      // the in-memory board state. Root cause we're fixing: pull replaces
+      // localBoard.lists wholesale with fresh uids for stacks that had no
+      // matching remoteId locally. Meanwhile our own writeCardFile at the
+      // end of pull triggers a vault "modify" event → queueCardFolderSync →
+      // reconcileListsFromIndex reads the *old* index file's meta and
+      // resurrects the previous list uids as fresh empty lists. Symptom
+      // is the exact "4 lists become 8, then stay at 8" pattern the user
+      // reported. Refreshing the index files here — inside the plugin's
+      // `reconciling` guard so our own writes don't kick the folder-sync
+      // debounce — ensures reconcileListsFromIndex is a no-op after the
+      // vault event fires. Best-effort per board.
+      this.plugin.reconciling = true;
+      try {
+        for (const localBoardId of boundLocalIds) {
+          const board = this.plugin.data.boards.find((b) => b.id === localBoardId);
+          if (!board) continue;
+          try {
+            await this.plugin.writeBoardIndexFile(board);
+          } catch (error) {
+            this.plugin.pushSyncLog({ event: "sync.board-index-rewrite-failed", boardId: localBoardId, message: (error && error.message) || String(error) });
+          }
+        }
+      } finally {
+        this.plugin.reconciling = false;
+      }
+
       await this.plugin.savePluginData();
       this.plugin.refreshViews();
 
@@ -5724,6 +5771,65 @@ class SyncManager {
     this.mergeBoardLabelsIntoGlobal(reconciled);
     await this.pullCards(client, hydrated.id, reconciled, stacks || []);
     return stacks || [];
+  }
+
+  /**
+   * Sweep `data.boards` for duplicates that render as phantom empty
+   * boards in the tab bar. Called once at the end of pull, after every
+   * remote board has been merged onto its bound local copy.
+   *
+   * `boundLocalIds` is the set of board ids that this sync's pull loop
+   * bound to a remote board — those are the canonical entries. Any other
+   * board that shadows one of them (by remoteId, folderPath, or name) is
+   * a leftover phantom. Two bound boards with the same folderPath are
+   * also collapsed (keeps the one that iterates first).
+   *
+   * Bindings pointing at removed boards are cleaned up so a future sync
+   * doesn't resurrect them via findOrBindLocalBoard's nameMatch branch.
+   */
+  pruneDuplicateBoards(boundLocalIds) {
+    const bindings = this.plugin.data.nextcloud.boardBindings || {};
+    const boards = this.plugin.data.boards;
+    const bound = boards.filter((b) => boundLocalIds.has(b.id));
+    const boundFolderPaths = new Set(bound.map((b) => (b.folderPath || "").trim()).filter(Boolean));
+    const boundNames = new Set(bound.map((b) => (b.name || "").trim().toLowerCase()).filter(Boolean));
+    const boundRemoteIds = new Set(bound.map((b) => b.remoteId).filter((r) => r != null));
+
+    const kept = [];
+    const dropped = [];
+    const seenBoundFolders = new Set();
+    for (const board of bound) {
+      const key = (board.folderPath || "").trim();
+      if (key && seenBoundFolders.has(key)) { dropped.push(board); continue; }
+      if (key) seenBoundFolders.add(key);
+      kept.push(board);
+    }
+    for (const board of boards) {
+      if (boundLocalIds.has(board.id)) continue;
+      const folder = (board.folderPath || "").trim();
+      const name = (board.name || "").trim().toLowerCase();
+      const isPhantom =
+        (board.remoteId != null && boundRemoteIds.has(board.remoteId))
+        || (folder && boundFolderPaths.has(folder))
+        || (name && boundNames.has(name));
+      if (isPhantom) { dropped.push(board); continue; }
+      kept.push(board);
+    }
+    if (!dropped.length) return;
+
+    this.plugin.data.boards = kept;
+    const droppedIds = new Set(dropped.map((b) => b.id));
+    for (const key of Object.keys(bindings)) {
+      if (droppedIds.has(key)) delete bindings[key];
+    }
+    if (this.plugin.data.activeBoardId && droppedIds.has(this.plugin.data.activeBoardId)) {
+      this.plugin.data.activeBoardId = (kept[0] && kept[0].id) || "";
+    }
+    this.plugin.debugLog({
+      event: "sync.prune-duplicate-boards",
+      droppedIds: Array.from(droppedIds),
+      keptCount: kept.length,
+    });
   }
 
   /**

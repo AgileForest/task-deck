@@ -99,9 +99,9 @@ class AttachmentSyncer {
       }
 
       try {
-        const download = await client.downloadAttachment(card.remoteId, remote.id);
+        const download = await client.downloadAttachment(card.remoteId, remote);
         if (!download || !download.data) continue;
-        const filename = sanitizeFilename(remote.data || remote.name || `attachment-${remote.id}`);
+        const filename = sanitizeFilename(remote.data || remote.name || (remote.extendedData && remote.extendedData.info && remote.extendedData.info.basename) || `attachment-${remote.id}`);
         const dir = joinPath(board.folderPath || "", "attachments", card.id);
         await this.ensureDir(dir);
         const filePath = await this.uniquePath(joinPath(dir, filename), existing ? existing.filePath : null);

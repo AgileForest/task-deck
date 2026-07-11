@@ -804,9 +804,9 @@ class AttachmentSyncer {
       }
 
       try {
-        const download = await client.downloadAttachment(card.remoteId, remote.id);
+        const download = await client.downloadAttachment(card.remoteId, remote);
         if (!download || !download.data) continue;
-        const filename = sanitizeFilename(remote.data || remote.name || `attachment-${remote.id}`);
+        const filename = sanitizeFilename(remote.data || remote.name || (remote.extendedData && remote.extendedData.info && remote.extendedData.info.basename) || `attachment-${remote.id}`);
         const dir = joinPath(board.folderPath || "", "attachments", card.id);
         await this.ensureDir(dir);
         const filePath = await this.uniquePath(joinPath(dir, filename), existing ? existing.filePath : null);
@@ -4511,21 +4511,62 @@ class DeckClient {
    * fall back to the legacy /index.php endpoint if the server returns a
    * 4xx. Both bypass /api/v1.0 and stream the file through PHP.
    */
-  async downloadAttachment(cardId, attachmentId) {
-    const primary = `${this.serverUrl}/index.php/apps/deck/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`;
+  /**
+   * Download an attachment's raw bytes.
+   *
+   * For Deck ≥ 1.3.0 (type=file), the underlying content is a regular
+   * Nextcloud Files item stored under `/Deck/…` in the user's home
+   * directory. The Web UI resolves it via `/f/{fileid}` (which redirects
+   * to the Files app view) — but for a headless byte-fetch we need the
+   * raw file, so we hit WebDAV directly:
+   *
+   *   GET /remote.php/dav/files/{username}/{extendedData.path}
+   *
+   * The legacy `/index.php/apps/deck/cards/{cardId}/attachment/{aid}`
+   * route only works for the pre-1.3 `type=deck_file` storage and
+   * responds with 403 for `type=file` attachments — which is what we
+   * were seeing in production before this rewrite.
+   *
+   * `attachment` should be the OCS attachment record returned by
+   * getAttachments / uploadAttachment; we read `extendedData.path` off
+   * it. Falls back to the legacy route if the extendedData is missing
+   * so old `deck_file` attachments still work.
+   */
+  async downloadAttachment(cardId, attachment) {
+    const ext = attachment && attachment.extendedData;
+    const path = ext && typeof ext.path === "string" ? ext.path : null;
+    // Prefer WebDAV when we have a resolvable Files path.
+    if (path) {
+      const cleanPath = path.startsWith("/") ? path.slice(1) : path;
+      const url = `${this.serverUrl}/remote.php/dav/files/${encodeURIComponent(this.username)}/${cleanPath.split("/").map(encodeURIComponent).join("/")}`;
+      const headers = this.buildHeaders();
+      headers.Accept = "*/*";
+      delete headers["Content-Type"];
+      delete headers["OCS-APIRequest"];
+      const response = await requestUrl({ url, method: "GET", headers, throw: false });
+      const status = response.status || 0;
+      if (status >= 200 && status < 300) {
+        return {
+          status,
+          data: response.arrayBuffer || null,
+          contentType: pickHeader(response, "content-type") || (ext && ext.mimetype) || "application/octet-stream",
+          headers: response.headers || {},
+        };
+      }
+      throw new DeckApiError(`Deck attachment download failed (${status}).`, { status, url, body: parseBody(response) });
+    }
+    // Legacy fallback: pre-1.3 `type=deck_file` route. Kept for very
+    // old servers or a corrupted extendedData; new deployments should
+    // never reach this branch.
+    const attachmentId = attachment && attachment.id != null ? attachment.id : attachment;
+    const url = `${this.serverUrl}/index.php/apps/deck/cards/${encodeURIComponent(cardId)}/attachment/${encodeURIComponent(attachmentId)}`;
     const headers = this.buildHeaders();
     headers.Accept = "*/*";
     delete headers["Content-Type"];
-
-    const response = await requestUrl({
-      url: primary,
-      method: "GET",
-      headers,
-      throw: false,
-    });
+    const response = await requestUrl({ url, method: "GET", headers, throw: false });
     const status = response.status || 0;
     if (status < 200 || status >= 300) {
-      throw new DeckApiError(`Deck attachment download failed (${status}).`, { status, url: primary, body: parseBody(response) });
+      throw new DeckApiError(`Deck attachment download failed (${status}).`, { status, url, body: parseBody(response) });
     }
     return {
       status,

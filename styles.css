@@ -2029,3 +2029,27 @@
   background: var(--background-secondary);
 }
 
+
+/* Support section caption — small link tucked under the "Buy me a coffee"
+   row. The parent .setting-item is display:flex row; we absolutely place
+   the caption so it lines up right-bottom without disrupting the button. */
+.ot-settings-support-caption {
+  position: absolute;
+  right: 0;
+  bottom: -4px;
+  font-size: 0.75em;
+  color: var(--text-muted);
+}
+.ot-settings-support-caption a {
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+.ot-settings-support-caption a:hover {
+  color: var(--text-normal);
+}
+/* Make the setting-item positioned so absolute caption anchors here. */
+.setting-item:has(.ot-settings-support-caption) {
+  position: relative;
+  padding-bottom: 22px;
+}

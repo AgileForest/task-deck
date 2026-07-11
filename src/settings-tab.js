@@ -402,6 +402,36 @@ class TaskDeckSettingTab extends PluginSettingTab {
             new SyncLogModal(this.app, this.plugin).open();
           });
       });
+
+    // ---- Support -------------------------------------------------------
+    // A "Buy me a coffee" style row for the current maintainer, followed
+    // by a small caption linking to the upstream Task Deck author (this
+    // plugin is forked from ismailivanov/task-deck). Kept last so it
+    // never gets in the way of functional settings.
+    containerEl.createEl("h3", { text: "Support" });
+
+    const supportSetting = new Setting(containerEl)
+      .setName("Support the maintainer")
+      .setDesc("If NextDeck saves you time, a coffee helps keep it maintained.")
+      .addButton((button) => {
+        button
+          .setButtonText("Buy me a coffee")
+          .setCta()
+          .onClick(() => {
+            window.open("https://buymeacoffee.com/onlymykazari", "_blank");
+          });
+      });
+
+    // Small caption anchored under the setting row. Rendered as a link so
+    // Obsidian styles it consistently; opening in a new tab so the user
+    // doesn't lose their Settings context.
+    const caption = supportSetting.settingEl.createDiv({ cls: "ot-settings-support-caption" });
+    const upstreamLink = caption.createEl("a", {
+      text: "Sponsor the upstream author",
+      href: "https://github.com/ismailivanov/task-deck",
+    });
+    upstreamLink.setAttr("target", "_blank");
+    upstreamLink.setAttr("rel", "noopener");
   }
 
   formatSyncStatus(nextcloud, override) {

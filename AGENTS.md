@@ -167,13 +167,27 @@ Fix: `pruneDuplicateBoards(boundLocalIds)` runs at the end of every pull. Keeps 
 
 ## 6. Community Plugins submission
 
-Full PR template lives at [.trae/documents/community-plugin-submission.md](file:///Users/victorsmith/Documents/trae_projects/task-deck/.trae/documents/community-plugin-submission.md). Includes:
+**As of late 2025, Obsidian moved plugin submission from the `obsidian-releases` PR flow to a self-service developer dashboard.** The old workflow (fork `obsidianmd/obsidian-releases`, add an entry to `community-plugins.json`, open a PR) is deprecated. Do **NOT** submit updates to `obsidian-releases`.
 
-- The exact JSON entry to append to `community-plugins.json`
-- A pre-filled PR description with compliance checklist
-- Reviewer-feedback playbook for common pushback
+### New submission flow
 
-Do NOT submit updates to `obsidian-releases` for version bumps. Once the plugin is accepted, new GitHub releases auto-distribute.
+1. Sign in to the [Obsidian Community developer portal](https://community.obsidian.md/account/plugins/new) with the same GitHub account that owns the plugin repo (permission scope granted at sign-in).
+2. Open **Developer Dashboard → New plugin**, pick the repo (`onlymykazari/obsidian-nextcloud-deck`) and target release tag.
+3. Fill in the plugin metadata that the form asks for (id / name / description come from the release-asset `manifest.json` — keep them clean before submitting).
+4. Submit. The **Automated Review System** runs a code + safety scan and returns a verdict within minutes right in the dashboard.
+
+Once the plugin is approved, new GitHub releases **still auto-distribute** — Obsidian's client pulls the latest tagged release from the linked repo. You never resubmit through the dashboard for a version bump; just publish a new release with matching `manifest.json`.
+
+### Submission gotchas we already hit
+
+- **`manifest.id` cannot start with `obsidian-`** — the form rejects it. Ours is `nextdeck`. If you rename, keep §9 (avoid renaming) in mind — but if you must, do it BEFORE the first submission, not after.
+- The dashboard reads `manifest.json` from the selected release asset, not from the repo's default branch. Always double-check the release you're pointing at has the correct fields.
+- Community Plugins currently ignores `authorUrl` — put a link in the plugin's Settings tab if you want it visible (we already do in the "Support" section).
+- `fundingUrl` renders as a ❤️ icon on the plugin's card in the browser once accepted.
+
+### Legacy note (kept for context, don't act on it)
+
+`.trae/documents/community-plugin-submission.md` was written for the old PR-based flow and is retained for archival reasons only. Its PR template / reviewer-playbook sections are obsolete. If you touch it, add a header pointing here.
 
 ## 7. Debugging with users
 

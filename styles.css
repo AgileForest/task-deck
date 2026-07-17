@@ -357,6 +357,13 @@
   transform: translateY(-1px);
 }
 
+/* Board re-renders replace every card element wholesale (see BoardView.render());
+   without this, a card sitting under the cursor would replay its hover-in
+   transition every time you click something, looking like a double-click flash. */
+.ot-card.ot-card-no-transition {
+  transition: none;
+}
+
 .ot-card.is-drop-target {
   border-color: var(--interactive-accent);
 }
@@ -1673,6 +1680,15 @@
   width: 100%;
 }
 
+.ot-checklist-add-input {
+  resize: none;
+  overflow: hidden;
+  min-height: 30px;
+  max-height: 220px;
+  line-height: 1.4;
+  font-family: inherit;
+}
+
 .is-hidden {
   display: none;
 }
@@ -1726,6 +1742,38 @@
   .ot-details-toolbar-group {
     flex-wrap: wrap;
   }
+}
+
+/* Trello-style itemized checklist shown on the card front. */
+.ot-card-checklist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0;
+}
+
+.ot-card-checklist-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.ot-card-checklist-item input[type="checkbox"] {
+  margin: 3px 0 0;
+  flex-shrink: 0;
+}
+
+.ot-card-checklist-item-text {
+  font-size: 13px;
+  line-height: 1.3;
+  color: var(--text-normal);
+}
+
+.ot-card-checklist-item.is-done .ot-card-checklist-item-text {
+  color: var(--text-muted);
+  text-decoration: line-through;
 }
 
 /* Card member assignment (avatars). */

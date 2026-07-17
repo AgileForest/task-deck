@@ -1703,9 +1703,12 @@ class CardModal extends Modal {
       }
 
       const addForm = createElement("form", "ot-checklist-add-form");
-      const addInput = createElement("input", "ot-input");
-      addInput.type = "text";
-      addInput.placeholder = "Checklist item";
+      // A textarea (not a single-line input) so pasting several lines at once
+      // keeps their line breaks — each line becomes its own checklist item on
+      // submit, instead of being flattened into one item's text.
+      const addInput = createElement("textarea", "ot-input ot-checklist-add-input");
+      addInput.rows = 1;
+      addInput.placeholder = "Checklist item (paste multiple lines to add them all)";
       const addButton = createElement("button", "mod-cta", "Add");
       addButtonIcon(addButton, "plus");
       const cancel = iconButton("x", "Cancel", () => {
@@ -1716,25 +1719,43 @@ class CardModal extends Modal {
       addForm.append(addInput, addButton, cancel);
       addForm.addEventListener("submit", (event) => {
         event.preventDefault();
-        const text = textLine(addInput.value);
-        if (!text) {
+        const lines = String(addInput.value || "")
+          .split(/\r?\n/)
+          .map((line) => textLine(line))
+          .filter(Boolean);
+        if (!lines.length) {
           addInput.focus();
           return;
         }
-        this.localChecklist.push({ done: false, text });
+        lines.forEach((text) => this.localChecklist.push({ done: false, text }));
         this.addingChecklistItem = false;
         renderChecklist();
         renderAddArea();
         this.saveNow().catch(console.error);
       });
+      const autoGrow = () => {
+        addInput.style.height = "auto";
+        addInput.style.height = `${addInput.scrollHeight}px`;
+      };
+      addInput.addEventListener("input", autoGrow);
       addInput.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
           this.addingChecklistItem = false;
           renderAddArea();
+          return;
+        }
+        // Enter submits (matching the old single-line input); Shift+Enter still
+        // inserts a newline for anyone typing a multi-line batch by hand.
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          addForm.requestSubmit();
         }
       });
       addArea.append(addForm);
-      requestAnimationFrame(() => addInput.focus());
+      requestAnimationFrame(() => {
+        addInput.focus();
+        autoGrow();
+      });
     };
 
     renderChecklist();

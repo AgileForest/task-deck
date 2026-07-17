@@ -70,6 +70,11 @@ class BoardView extends ItemView {
   render() {
     const board = this.plugin.getBoard();
     this.stopPresence();
+    // render() runs a full teardown/rebuild on every card or list mutation, which
+    // would otherwise reset the board's horizontal scroll and every list's
+    // vertical scroll back to zero (e.g. checking off a card near the bottom of
+    // a long list). Snapshot positions now, restore them once the new DOM is in.
+    const scrollState = this.captureScrollState();
     this.contentEl.replaceChildren();
     this.contentEl.addClass("ot-board-root");
     this.contentEl.classList.toggle("is-compact-labels", !!this.plugin.data.compactLabels);
@@ -122,6 +127,40 @@ class BoardView extends ItemView {
 
     this.contentEl.append(toolbar, scroller);
     this.startPresence(board);
+    this.restoreScrollState(scrollState);
+    // Cards mount with transitions suppressed (see renderCard) so a full rebuild
+    // doesn't replay the hover-in animation under a cursor that never moved.
+    // Re-enable next frame so real hover/drag interactions still animate.
+    requestAnimationFrame(() => {
+      this.contentEl.querySelectorAll(".ot-card-no-transition").forEach((el) => el.classList.remove("ot-card-no-transition"));
+    });
+  }
+
+  /** Reads current scroll offsets before render() tears the DOM down. */
+  captureScrollState() {
+    const boardScroll = this.contentEl.querySelector(":scope > .ot-board-scroll");
+    const listScrollTop = {};
+    this.contentEl.querySelectorAll(".ot-list").forEach((column) => {
+      const cards = column.querySelector(".ot-cards");
+      if (cards && column.dataset.listId) listScrollTop[column.dataset.listId] = cards.scrollTop;
+    });
+    return {
+      boardScrollLeft: boardScroll ? boardScroll.scrollLeft : 0,
+      listScrollTop,
+    };
+  }
+
+  /** Re-applies scroll offsets captured by captureScrollState() to the fresh DOM. */
+  restoreScrollState(state) {
+    if (!state) return;
+    const boardScroll = this.contentEl.querySelector(":scope > .ot-board-scroll");
+    if (boardScroll) boardScroll.scrollLeft = state.boardScrollLeft;
+    this.contentEl.querySelectorAll(".ot-list").forEach((column) => {
+      const top = state.listScrollTop[column.dataset.listId];
+      if (top == null) return;
+      const cards = column.querySelector(".ot-cards");
+      if (cards) cards.scrollTop = top;
+    });
   }
 
   // "Update available" banner shown at the top when a newer GitHub release exists
@@ -1209,7 +1248,7 @@ class BoardView extends ItemView {
    * and compact metadata badges.
    */
   renderCard(card, list) {
-    const element = createElement("article", "ot-card");
+    const element = createElement("article", "ot-card ot-card-no-transition");
     const isRenaming = this.editingCardId === card.id;
     const lockHolder = this.plugin.getCardLockHolder(card.id);
     const lockedByOther = !!lockHolder;
@@ -1283,6 +1322,10 @@ class BoardView extends ItemView {
     if (labels.childElementCount) element.append(labels);
     element.append(main);
 
+    if (this.plugin.data.showChecklistOnCards && (card.checklist || []).length) {
+      element.append(this.renderCardChecklist(card));
+    }
+
     const meta = this.renderCardMeta(card);
     const assignees = this.renderCardAssignees(card);
     if (meta.childElementCount || assignees.childElementCount) {
@@ -1294,6 +1337,32 @@ class BoardView extends ItemView {
     if (lockedByOther) element.append(this.buildLockBadge(lockHolder));
 
     return element;
+  }
+
+  /**
+   * Trello-style itemized checklist shown on the card front, toggleable
+   * without opening the card. Only rendered when the "Show checklist on
+   * cards" setting is on.
+   */
+  renderCardChecklist(card) {
+    const wrap = createElement("div", "ot-card-checklist-list");
+    (card.checklist || []).forEach((item, index) => {
+      const row = createElement("label", "ot-card-checklist-item");
+      row.draggable = false;
+      row.addEventListener("click", (event) => event.stopPropagation());
+      if (item.done) row.classList.add("is-done");
+      const checkbox = createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = !!item.done;
+      checkbox.addEventListener("change", async (event) => {
+        event.stopPropagation();
+        row.classList.toggle("is-done", checkbox.checked);
+        await this.plugin.toggleChecklistItem(card.id, index);
+      });
+      row.append(checkbox, createElement("span", "ot-card-checklist-item-text", item.text));
+      wrap.append(row);
+    });
+    return wrap;
   }
 
   renderCardAssignees(card) {
@@ -1401,7 +1470,7 @@ class BoardView extends ItemView {
       meta.append(badge);
     }
 
-    if ((card.checklist || []).length) {
+    if ((card.checklist || []).length && !this.plugin.data.showChecklistOnCards) {
       const stats = checklistStats(card.checklist);
       const badge = createElement("span", "ot-card-meta-item ot-card-checklist-badge");
       const icon = createElement("span", "ot-card-checklist-icon");

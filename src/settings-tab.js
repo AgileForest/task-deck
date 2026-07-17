@@ -52,6 +52,15 @@ class TaskDeckSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName("Show checklist on cards")
+      .setDesc("Show each checklist item on the card front, Trello-style, so you can check them off without opening the card.")
+      .addToggle((toggle) => toggle
+        .setValue(!!this.plugin.data.showChecklistOnCards)
+        .onChange(async () => {
+          await this.plugin.toggleShowChecklistOnCards();
+        }));
+
+    new Setting(containerEl)
       .setName("Completion sound")
       .setDesc("Play a short sound when a card is marked complete.")
       .addToggle((toggle) => toggle

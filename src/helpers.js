@@ -44,6 +44,7 @@ const DEFAULT_DATA = {
   activeBoardId: "",
   completionSound: true,
   compactLabels: false,
+  showChecklistOnCards: false,
   layoutMigrated: false,
   boards: [],
   cards: {},

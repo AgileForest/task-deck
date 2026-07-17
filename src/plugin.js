@@ -212,6 +212,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.data.labels = this.data.labels || [];
     this.data.completionSound = this.data.completionSound !== false;
     this.data.compactLabels = !!this.data.compactLabels;
+    this.data.showChecklistOnCards = !!this.data.showChecklistOnCards;
     this.data.labels = this.normalizeGlobalLabels(this.data.labels);
     this.data.boards = this.data.boards.map((board) => this.normalizeBoard(board));
     this.loadNeedsSave = this.ensureListColors();
@@ -802,6 +803,12 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
 
   async toggleCompactLabels() {
     this.data.compactLabels = !this.data.compactLabels;
+    await this.savePluginData();
+    this.refreshViews();
+  }
+
+  async toggleShowChecklistOnCards() {
+    this.data.showChecklistOnCards = !this.data.showChecklistOnCards;
     await this.savePluginData();
     this.refreshViews();
   }
@@ -1522,6 +1529,14 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       this.completedAnimationCardId = null;
     }
     await this.updateCard(cardId, { completed });
+  }
+
+  async toggleChecklistItem(cardId, index) {
+    const card = this.data.cards[cardId];
+    if (!card || !Array.isArray(card.checklist) || !card.checklist[index]) return;
+    const checklist = clone(card.checklist);
+    checklist[index].done = !checklist[index].done;
+    await this.updateCard(cardId, { checklist });
   }
 
   playCompletionSound() {

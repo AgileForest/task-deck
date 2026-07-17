@@ -47,6 +47,7 @@ const DEFAULT_DATA = {
   activeBoardId: "",
   completionSound: true,
   compactLabels: false,
+  showChecklistOnCards: false,
   layoutMigrated: false,
   boards: [],
   cards: {},
@@ -2364,9 +2365,12 @@ class CardModal extends Modal {
       }
 
       const addForm = createElement("form", "ot-checklist-add-form");
-      const addInput = createElement("input", "ot-input");
-      addInput.type = "text";
-      addInput.placeholder = "Checklist item";
+      // A textarea (not a single-line input) so pasting several lines at once
+      // keeps their line breaks — each line becomes its own checklist item on
+      // submit, instead of being flattened into one item's text.
+      const addInput = createElement("textarea", "ot-input ot-checklist-add-input");
+      addInput.rows = 1;
+      addInput.placeholder = "Checklist item (paste multiple lines to add them all)";
       const addButton = createElement("button", "mod-cta", "Add");
       addButtonIcon(addButton, "plus");
       const cancel = iconButton("x", "Cancel", () => {
@@ -2377,25 +2381,43 @@ class CardModal extends Modal {
       addForm.append(addInput, addButton, cancel);
       addForm.addEventListener("submit", (event) => {
         event.preventDefault();
-        const text = textLine(addInput.value);
-        if (!text) {
+        const lines = String(addInput.value || "")
+          .split(/\r?\n/)
+          .map((line) => textLine(line))
+          .filter(Boolean);
+        if (!lines.length) {
           addInput.focus();
           return;
         }
-        this.localChecklist.push({ done: false, text });
+        lines.forEach((text) => this.localChecklist.push({ done: false, text }));
         this.addingChecklistItem = false;
         renderChecklist();
         renderAddArea();
         this.saveNow().catch(console.error);
       });
+      const autoGrow = () => {
+        addInput.style.height = "auto";
+        addInput.style.height = `${addInput.scrollHeight}px`;
+      };
+      addInput.addEventListener("input", autoGrow);
       addInput.addEventListener("keydown", (event) => {
         if (event.key === "Escape") {
           this.addingChecklistItem = false;
           renderAddArea();
+          return;
+        }
+        // Enter submits (matching the old single-line input); Shift+Enter still
+        // inserts a newline for anyone typing a multi-line batch by hand.
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          addForm.requestSubmit();
         }
       });
       addArea.append(addForm);
-      requestAnimationFrame(() => addInput.focus());
+      requestAnimationFrame(() => {
+        addInput.focus();
+        autoGrow();
+      });
     };
 
     renderChecklist();
@@ -2540,6 +2562,11 @@ class BoardView extends ItemView {
   render() {
     const board = this.plugin.getBoard();
     this.stopPresence();
+    // render() runs a full teardown/rebuild on every card or list mutation, which
+    // would otherwise reset the board's horizontal scroll and every list's
+    // vertical scroll back to zero (e.g. checking off a card near the bottom of
+    // a long list). Snapshot positions now, restore them once the new DOM is in.
+    const scrollState = this.captureScrollState();
     this.contentEl.replaceChildren();
     this.contentEl.addClass("ot-board-root");
     this.contentEl.classList.toggle("is-compact-labels", !!this.plugin.data.compactLabels);
@@ -2592,6 +2619,40 @@ class BoardView extends ItemView {
 
     this.contentEl.append(toolbar, scroller);
     this.startPresence(board);
+    this.restoreScrollState(scrollState);
+    // Cards mount with transitions suppressed (see renderCard) so a full rebuild
+    // doesn't replay the hover-in animation under a cursor that never moved.
+    // Re-enable next frame so real hover/drag interactions still animate.
+    requestAnimationFrame(() => {
+      this.contentEl.querySelectorAll(".ot-card-no-transition").forEach((el) => el.classList.remove("ot-card-no-transition"));
+    });
+  }
+
+  /** Reads current scroll offsets before render() tears the DOM down. */
+  captureScrollState() {
+    const boardScroll = this.contentEl.querySelector(":scope > .ot-board-scroll");
+    const listScrollTop = {};
+    this.contentEl.querySelectorAll(".ot-list").forEach((column) => {
+      const cards = column.querySelector(".ot-cards");
+      if (cards && column.dataset.listId) listScrollTop[column.dataset.listId] = cards.scrollTop;
+    });
+    return {
+      boardScrollLeft: boardScroll ? boardScroll.scrollLeft : 0,
+      listScrollTop,
+    };
+  }
+
+  /** Re-applies scroll offsets captured by captureScrollState() to the fresh DOM. */
+  restoreScrollState(state) {
+    if (!state) return;
+    const boardScroll = this.contentEl.querySelector(":scope > .ot-board-scroll");
+    if (boardScroll) boardScroll.scrollLeft = state.boardScrollLeft;
+    this.contentEl.querySelectorAll(".ot-list").forEach((column) => {
+      const top = state.listScrollTop[column.dataset.listId];
+      if (top == null) return;
+      const cards = column.querySelector(".ot-cards");
+      if (cards) cards.scrollTop = top;
+    });
   }
 
   // "Update available" banner shown at the top when a newer GitHub release exists
@@ -3679,7 +3740,7 @@ class BoardView extends ItemView {
    * and compact metadata badges.
    */
   renderCard(card, list) {
-    const element = createElement("article", "ot-card");
+    const element = createElement("article", "ot-card ot-card-no-transition");
     const isRenaming = this.editingCardId === card.id;
     const lockHolder = this.plugin.getCardLockHolder(card.id);
     const lockedByOther = !!lockHolder;
@@ -3753,6 +3814,10 @@ class BoardView extends ItemView {
     if (labels.childElementCount) element.append(labels);
     element.append(main);
 
+    if (this.plugin.data.showChecklistOnCards && (card.checklist || []).length) {
+      element.append(this.renderCardChecklist(card));
+    }
+
     const meta = this.renderCardMeta(card);
     const assignees = this.renderCardAssignees(card);
     if (meta.childElementCount || assignees.childElementCount) {
@@ -3764,6 +3829,32 @@ class BoardView extends ItemView {
     if (lockedByOther) element.append(this.buildLockBadge(lockHolder));
 
     return element;
+  }
+
+  /**
+   * Trello-style itemized checklist shown on the card front, toggleable
+   * without opening the card. Only rendered when the "Show checklist on
+   * cards" setting is on.
+   */
+  renderCardChecklist(card) {
+    const wrap = createElement("div", "ot-card-checklist-list");
+    (card.checklist || []).forEach((item, index) => {
+      const row = createElement("label", "ot-card-checklist-item");
+      row.draggable = false;
+      row.addEventListener("click", (event) => event.stopPropagation());
+      if (item.done) row.classList.add("is-done");
+      const checkbox = createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = !!item.done;
+      checkbox.addEventListener("change", async (event) => {
+        event.stopPropagation();
+        row.classList.toggle("is-done", checkbox.checked);
+        await this.plugin.toggleChecklistItem(card.id, index);
+      });
+      row.append(checkbox, createElement("span", "ot-card-checklist-item-text", item.text));
+      wrap.append(row);
+    });
+    return wrap;
   }
 
   renderCardAssignees(card) {
@@ -3871,7 +3962,7 @@ class BoardView extends ItemView {
       meta.append(badge);
     }
 
-    if ((card.checklist || []).length) {
+    if ((card.checklist || []).length && !this.plugin.data.showChecklistOnCards) {
       const stats = checklistStats(card.checklist);
       const badge = createElement("span", "ot-card-meta-item ot-card-checklist-badge");
       const icon = createElement("span", "ot-card-checklist-icon");
@@ -4011,6 +4102,15 @@ class TaskDeckSettingTab extends PluginSettingTab {
           this.plugin.data.compactLabels = value;
           await this.plugin.savePluginData();
           this.plugin.refreshViews();
+        }));
+
+    new Setting(containerEl)
+      .setName("Show checklist on cards")
+      .setDesc("Show each checklist item on the card front, Trello-style, so you can check them off without opening the card.")
+      .addToggle((toggle) => toggle
+        .setValue(!!this.plugin.data.showChecklistOnCards)
+        .onChange(async () => {
+          await this.plugin.toggleShowChecklistOnCards();
         }));
 
     new Setting(containerEl)
@@ -4280,6 +4380,7 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
     this.data.labels = this.data.labels || [];
     this.data.completionSound = this.data.completionSound !== false;
     this.data.compactLabels = !!this.data.compactLabels;
+    this.data.showChecklistOnCards = !!this.data.showChecklistOnCards;
     this.data.labels = this.normalizeGlobalLabels(this.data.labels);
     this.data.boards = this.data.boards.map((board) => this.normalizeBoard(board));
     this.loadNeedsSave = this.ensureListColors();
@@ -4870,6 +4971,12 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
 
   async toggleCompactLabels() {
     this.data.compactLabels = !this.data.compactLabels;
+    await this.savePluginData();
+    this.refreshViews();
+  }
+
+  async toggleShowChecklistOnCards() {
+    this.data.showChecklistOnCards = !this.data.showChecklistOnCards;
     await this.savePluginData();
     this.refreshViews();
   }
@@ -5590,6 +5697,14 @@ module.exports = class ObsidianTasksKanbanPlugin extends Plugin {
       this.completedAnimationCardId = null;
     }
     await this.updateCard(cardId, { completed });
+  }
+
+  async toggleChecklistItem(cardId, index) {
+    const card = this.data.cards[cardId];
+    if (!card || !Array.isArray(card.checklist) || !card.checklist[index]) return;
+    const checklist = clone(card.checklist);
+    checklist[index].done = !checklist[index].done;
+    await this.updateCard(cardId, { checklist });
   }
 
   playCompletionSound() {
